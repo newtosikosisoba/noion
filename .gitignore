@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+.ffmpeg_path.json
