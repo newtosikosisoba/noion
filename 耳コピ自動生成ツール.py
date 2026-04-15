@@ -35,6 +35,7 @@ def _ensure_packages():
                if not _importable(imp)]
     if missing:
         print(f"[初回セットアップ] パッケージをインストールします: {', '.join(missing)}")
+        failed = []
         for pkg in missing:
             try:
                 subprocess.check_call(
@@ -43,9 +44,15 @@ def _ensure_packages():
                 )
                 print(f"  ✓ {pkg}")
             except subprocess.CalledProcessError:
-                print(f"  ✗ {pkg} のインストールに失敗しました（後で手動インストールを試してください）")
+                print(f"  ✗ {pkg} のインストールに失敗しました")
+                failed.append(pkg)
         print("インストール完了。起動します...\n")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # Windows では os.execv が正しく動作しないため subprocess で再起動
+        if platform.system() == "Windows":
+            ret = subprocess.call([sys.executable] + sys.argv)
+            sys.exit(ret)
+        else:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def _importable(name):
@@ -53,7 +60,12 @@ def _importable(name):
     return importlib.util.find_spec(name) is not None
 
 
-_ensure_packages()
+try:
+    _ensure_packages()
+except Exception as e:
+    print(f"パッケージセットアップ中にエラー: {e}")
+    input("Enterキーで終了...")
+    sys.exit(1)
 
 # =====================================================
 # 依存インポート
@@ -838,14 +850,23 @@ def _run_cli(args):
 # =====================================================
 
 if __name__ == "__main__":
-    # コマンドライン引数があればCLIモード、なければGUIモード
-    if len(sys.argv) > 1:
-        _run_cli(sys.argv[1:])
-    else:
-        try:
+    try:
+        # コマンドライン引数があればCLIモード、なければGUIモード
+        if len(sys.argv) > 1:
+            _run_cli(sys.argv[1:])
+        else:
             _init_gui()
             App().run()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            input("\nエラーが発生しました。上のメッセージをコピーしてください。\nEnterキーで終了...")
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("\n" + "=" * 50)
+        print("エラーが発生しました。")
+        print("上のメッセージをコピーして開発者に報告してください。")
+        print("=" * 50)
+        try:
+            input("Enterキーで終了...")
+        except EOFError:
+            pass
