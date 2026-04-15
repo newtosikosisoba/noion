@@ -183,49 +183,93 @@ class EarCopyEngine:
         else:
             print(f"[{pct or '--':>3}%] {msg}")
 
-    # ---- CQT多声部検出 -----------------------------------
+    # ---- 高精度CQT多声部検出 v5 ----------------------------
 
     def _detect_all_notes(self, y_h, sr):
-        """CQTベースの多声部ノート検出。同時発音を全て検出する"""
-        from scipy.ndimage import uniform_filter1d
+        """CQT + オンセット同期 + 適応スレッショルド + 倍音除去"""
+        from scipy.ndimage import median_filter, uniform_filter1d
+
+        self._log("  CQT解析中...", 26)
         n_bins = 84
+        bpo = 12
+        fmin = librosa.note_to_hz('C1')
         C = np.abs(librosa.cqt(y_h, sr=sr, hop_length=HOP,
-                                fmin=librosa.note_to_hz('C1'),
-                                n_bins=n_bins, bins_per_octave=12))
+                                fmin=fmin, n_bins=n_bins, bins_per_octave=bpo))
         C_db = librosa.amplitude_to_db(C, ref=np.max)
-        C_sm = uniform_filter1d(C_db, size=5, axis=1)
-        freqs = librosa.cqt_frequencies(n_bins, fmin=librosa.note_to_hz('C1'),
-                                         bins_per_octave=12)
+
+        # 時間方向の中央値フィルタで定常ノイズ除去
+        bg = median_filter(C_db, size=(1, 31))
+        C_clean = C_db - bg
+        C_sm = uniform_filter1d(C_clean, size=3, axis=1)
+
+        freqs = librosa.cqt_frequencies(n_bins, fmin=fmin, bins_per_octave=bpo)
         midi_notes = np.round(librosa.hz_to_midi(freqs)).astype(int)
         times = librosa.frames_to_time(np.arange(C_sm.shape[1]),
                                         sr=sr, hop_length=HOP)
-        threshold = -28
+
+        # オンセット検出（ノートの開始タイミングを正確に）
+        self._log("  オンセット検出中...", 30)
+        onset_env = librosa.onset.onset_strength(y=y_h, sr=sr, hop_length=HOP)
+        onsets_fr = librosa.onset.onset_detect(y=y_h, sr=sr, hop_length=HOP,
+                                                onset_envelope=onset_env,
+                                                backtrack=True)
+        onset_set = set(onsets_fr.tolist())
+
+        # 適応スレッショルド: 各フレームの上位N%をノートとみなす
+        self._log("  ノートトラッキング中...", 33)
         active = {}
         events = []
         for fi in range(C_sm.shape[1]):
             frame = C_sm[:, fi]
+            # 適応閾値: フレーム内の最大値から相対的に決定
+            frame_max = np.max(frame)
+            thr = max(frame_max - 22, 3.0)  # 最大値から22dB以内 + 最低3dB超え
+
             on_now = set()
+            peaks = []
             for bi in range(1, n_bins - 1):
-                if (frame[bi] > threshold and
+                if (frame[bi] > thr and
                         frame[bi] >= frame[bi-1] and frame[bi] >= frame[bi+1]):
+                    peaks.append((bi, frame[bi]))
+
+            # 倍音除去: 低い音が強い場合、その倍音を除去
+            if peaks:
+                peaks.sort(key=lambda x: x[1], reverse=True)
+                kept = []
+                used_midi = set()
+                for bi, en in peaks:
                     mn = int(midi_notes[bi])
+                    # 既に検出済み音の倍音(+12,+19,+24,+28,+31半音)かチェック
+                    is_harmonic = False
+                    for km in used_midi:
+                        diff = mn - km
+                        if diff in (12, 19, 24, 28, 31):
+                            is_harmonic = True
+                            break
+                    if not is_harmonic:
+                        kept.append((bi, en, mn))
+                        used_midi.add(mn)
+                for bi, en, mn in kept:
                     on_now.add(mn)
                     if mn not in active:
-                        active[mn] = (fi, frame[bi])
+                        active[mn] = (fi, en, fi in onset_set)
                     else:
-                        s, mx = active[mn]
-                        active[mn] = (s, max(mx, frame[bi]))
+                        sf_, mx, has_onset = active[mn]
+                        active[mn] = (sf_, max(mx, en), has_onset or (fi in onset_set))
+
+            # ノートオフ
             for mn in list(active):
                 if mn not in on_now:
-                    sf_, mx = active.pop(mn)
-                    dur = times[fi] - times[sf_]
-                    if dur >= 0.07:
-                        vel = int(np.clip((mx + 50) * 2.2, 40, 127))
+                    sf_, mx, has_onset = active.pop(mn)
+                    dur = times[min(fi, len(times)-1)] - times[sf_]
+                    if dur >= 0.06:
+                        vel = int(np.clip(mx * 3.5 + 30, 35, 127))
                         events.append((times[sf_], dur, mn, vel))
-        for mn, (sf_, mx) in active.items():
+
+        for mn, (sf_, mx, has_onset) in active.items():
             dur = times[-1] - times[sf_]
-            if dur >= 0.07:
-                vel = int(np.clip((mx + 50) * 2.2, 40, 127))
+            if dur >= 0.06:
+                vel = int(np.clip(mx * 3.5 + 30, 35, 127))
                 events.append((times[sf_], dur, mn, vel))
         return events
 
