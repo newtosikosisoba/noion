@@ -66,6 +66,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import tempfile
+import shutil
+import json
 from pathlib import Path
 
 try:
@@ -73,6 +75,91 @@ try:
     HAS_DND = True
 except Exception:
     HAS_DND = False
+
+
+# =====================================================
+# ffmpeg 自動検出・設定
+# =====================================================
+
+_FFMPEG_CONFIG = Path(__file__).parent / ".ffmpeg_path.json"
+
+def _find_ffmpeg():
+    """ffmpegのパスを解決する。見つからなければユーザーに選択させる"""
+    # 1. PATH にある場合はそのまま使う
+    if shutil.which("ffmpeg"):
+        return shutil.which("ffmpeg")
+
+    # 2. 前回設定を保存していた場合
+    if _FFMPEG_CONFIG.exists():
+        try:
+            saved = json.loads(_FFMPEG_CONFIG.read_text())
+            p = saved.get("path", "")
+            if p and Path(p).exists():
+                return p
+        except Exception:
+            pass
+
+    # 3. よくある場所を自動検索（Windows）
+    candidates = []
+    if platform.system() == "Windows":
+        for drive in ["C:", "D:"]:
+            for name in ["ffmpeg", "ffmpeg-*"]:
+                import glob
+                candidates += glob.glob(f"{drive}\\{name}\\bin\\ffmpeg.exe")
+                candidates += glob.glob(f"{drive}\\Program Files\\{name}\\bin\\ffmpeg.exe")
+                candidates += glob.glob(f"{drive}\\Users\\*\\Downloads\\{name}*\\bin\\ffmpeg.exe")
+        for c in candidates:
+            if Path(c).exists():
+                _save_ffmpeg(c)
+                return c
+
+    # 4. ユーザーに手動選択させる（GUIダイアログ）
+    import tkinter as _tk
+    from tkinter import filedialog as _fd, messagebox as _mb
+    _root = _tk.Tk()
+    _root.withdraw()
+    _mb.showinfo(
+        "ffmpeg が見つかりません",
+        "ffmpeg.exe の場所を選択してください。\n\n"
+        "ダウンロードした ffmpeg フォルダの中の\n"
+        "bin\\ffmpeg.exe を選択してください。"
+    )
+    path = _fd.askopenfilename(
+        title="ffmpeg.exe を選択",
+        filetypes=[("ffmpeg", "ffmpeg.exe"), ("実行ファイル", "*.exe"), ("全て", "*")]
+    )
+    _root.destroy()
+
+    if path and Path(path).exists():
+        _save_ffmpeg(path)
+        return path
+
+    return None
+
+
+def _save_ffmpeg(path):
+    try:
+        _FFMPEG_CONFIG.write_text(json.dumps({"path": str(path)}))
+    except Exception:
+        pass
+
+
+def _setup_ffmpeg():
+    """pydub に ffmpeg パスをセットする"""
+    p = _find_ffmpeg()
+    if p:
+        AudioSegment.converter = str(p)
+        # ffprobe も同じ bin フォルダにある場合はセット
+        probe = Path(p).parent / (
+            "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
+        )
+        if probe.exists():
+            AudioSegment.ffprobe = str(probe)
+        return True
+    return False
+
+
+_FFMPEG_OK = _setup_ffmpeg()
 
 
 # =====================================================
@@ -419,6 +506,11 @@ class EarCopyEngine:
     # ---- ファイル保存 ------------------------------------
 
     def _save_mp3(self, audio, path):
+        if not _FFMPEG_OK:
+            raise RuntimeError(
+                "ffmpeg が見つかりませんでした。\n"
+                "ツールを再起動して ffmpeg.exe の場所を選択してください。"
+            )
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp = f.name
         sf.write(tmp, audio, SR)
