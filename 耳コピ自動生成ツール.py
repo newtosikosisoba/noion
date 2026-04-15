@@ -249,7 +249,9 @@ class EarCopyEngine:
         self._log("テンポ・リズム解析中...", 18)
         tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
         beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=HOP)
-        return float(tempo), beat_times
+        # librosa 0.10+ では tempo が配列で返る場合があるため先頭要素を取得
+        tempo_val = float(np.atleast_1d(tempo)[0])
+        return tempo_val, beat_times
 
     # ---- メロディー検出 ----------------------------------
 
