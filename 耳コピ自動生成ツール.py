@@ -441,11 +441,18 @@ class EarCopyEngine:
 
     def _env(self, t, a=0.01, d=0.1, s=0.7, r=0.15):
         n = len(t)
+        if n == 0:
+            return np.array([])
         e = np.ones(n) * s
-        ai, di, ri = int(a * SR), int(d * SR), int(r * SR)
-        if ai > 0: e[:min(ai, n)] = np.linspace(0, 1, min(ai, n))
-        if di > 0: e[ai:min(ai+di, n)] = np.linspace(1, s, min(di, n - ai))
-        if ri > 0: e[max(n-ri, 0):] *= np.linspace(1, 0, min(ri, n))
+        ai = min(int(a * SR), n)
+        di = min(int(d * SR), max(n - ai, 0))
+        ri = min(int(r * SR), n)
+        if ai > 0:
+            e[:ai] = np.linspace(0, 1, ai)
+        if di > 0:
+            e[ai:ai+di] = np.linspace(1, s, di)
+        if ri > 0:
+            e[n-ri:] *= np.linspace(1, 0, ri)
         return e
 
     def _tone_piano(self, midi, dur, vel):
