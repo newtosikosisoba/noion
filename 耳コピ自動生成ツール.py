@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-耳コピ自動生成ツール v3.0
+耳コピ自動生成ツール v5.0
 MP3をドラッグ&ドロップするだけで耳コピ音源（MIDI再合成）を自動作成
 
 必要環境: Python 3.8+
 初回起動時に依存パッケージを自動インストールします
+
+使い方:
+  GUI:  python 耳コピ自動生成ツール.py
+  CLI:  python 耳コピ自動生成ツール.py input.mp3 [-o output.mp3]
 """
 
 import os
@@ -62,19 +66,38 @@ from scipy.signal import butter, filtfilt
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
 from pydub import AudioSegment
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
 import threading
 import tempfile
 import shutil
 import json
 from pathlib import Path
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    HAS_DND = True
-except Exception:
-    HAS_DND = False
+# tkinter は GUI モード時のみインポート（CLIモードでは不要）
+tk = None
+ttk = None
+messagebox = None
+filedialog = None
+HAS_DND = False
+TkinterDnD = None
+DND_FILES = None
+
+
+def _init_gui():
+    """GUIモード起動時にtkinter関連をインポートする"""
+    global tk, ttk, messagebox, filedialog, HAS_DND, TkinterDnD, DND_FILES
+    import tkinter as _tk
+    from tkinter import ttk as _ttk, messagebox as _mb, filedialog as _fd
+    tk = _tk
+    ttk = _ttk
+    messagebox = _mb
+    filedialog = _fd
+    try:
+        from tkinterdnd2 import DND_FILES as _dnd, TkinterDnD as _TkDnD
+        HAS_DND = True
+        TkinterDnD = _TkDnD
+        DND_FILES = _dnd
+    except Exception:
+        HAS_DND = False
 
 
 # =====================================================
@@ -114,25 +137,28 @@ def _find_ffmpeg():
                 return c
 
     # 4. ユーザーに手動選択させる（GUIダイアログ）
-    import tkinter as _tk
-    from tkinter import filedialog as _fd, messagebox as _mb
-    _root = _tk.Tk()
-    _root.withdraw()
-    _mb.showinfo(
-        "ffmpeg が見つかりません",
-        "ffmpeg.exe の場所を選択してください。\n\n"
-        "ダウンロードした ffmpeg フォルダの中の\n"
-        "bin\\ffmpeg.exe を選択してください。"
-    )
-    path = _fd.askopenfilename(
-        title="ffmpeg.exe を選択",
-        filetypes=[("ffmpeg", "ffmpeg.exe"), ("実行ファイル", "*.exe"), ("全て", "*")]
-    )
-    _root.destroy()
+    try:
+        import tkinter as _tk
+        from tkinter import filedialog as _fd, messagebox as _mb
+        _root = _tk.Tk()
+        _root.withdraw()
+        _mb.showinfo(
+            "ffmpeg が見つかりません",
+            "ffmpeg.exe の場所を選択してください。\n\n"
+            "ダウンロードした ffmpeg フォルダの中の\n"
+            "bin\\ffmpeg.exe を選択してください。"
+        )
+        path = _fd.askopenfilename(
+            title="ffmpeg.exe を選択",
+            filetypes=[("ffmpeg", "ffmpeg.exe"), ("実行ファイル", "*.exe"), ("全て", "*")]
+        )
+        _root.destroy()
 
-    if path and Path(path).exists():
-        _save_ffmpeg(path)
-        return path
+        if path and Path(path).exists():
+            _save_ffmpeg(path)
+            return path
+    except ImportError:
+        print("警告: ffmpeg が見つかりません。PATHにffmpegを追加してください。")
 
     return None
 
@@ -172,7 +198,7 @@ SEMI = 2 ** (1 / 12)
 
 
 class EarCopyEngine:
-    """音楽分析 → 耳コピ音源生成エンジン v4.0（多声部・多楽器）"""
+    """音楽分析 → 耳コピ音源生成エンジン v5.0（多声部・多楽器・倍音除去）"""
 
     def __init__(self, on_progress=None):
         self._cb = on_progress
@@ -357,95 +383,10 @@ class EarCopyEngine:
         beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=HOP)
         # librosa 0.10+ では tempo が配列で返る場合があるため先頭要素を取得
         tempo_val = float(np.atleast_1d(tempo)[0])
+        # テンポが検出できなかった場合は120BPMをデフォルトとする
+        if tempo_val <= 0:
+            tempo_val = 120.0
         return tempo_val, beat_times
-
-    # ---- メロディー検出 ----------------------------------
-
-    def _melody(self, yh, sr):
-        """(time, hz, duration) のリストを返す"""
-        self._log("メロディー解析中 (pyin)...", 28)
-        f0, voiced, _ = librosa.pyin(
-            yh,
-            fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7"),
-            sr=sr, hop_length=HOP
-        )
-        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
-        return self._f0_to_events(f0, voiced, times, max_gap_hz=8)
-
-    # ---- ベース検出 -------------------------------------
-
-    def _bass(self, yh, sr):
-        self._log("ベースライン解析中...", 42)
-        nyq = sr / 2
-        b, a = butter(4, min(250 / nyq, 0.99), btype="low")
-        yb = filtfilt(b, a, yh)
-        f0, voiced, _ = librosa.pyin(
-            yb,
-            fmin=librosa.note_to_hz("C1"),
-            fmax=librosa.note_to_hz("C3"),
-            sr=sr, hop_length=HOP * 2
-        )
-        times = librosa.frames_to_time(
-            np.arange(len(f0)), sr=sr, hop_length=HOP * 2
-        )
-        return self._f0_to_events(f0, voiced, times, max_gap_hz=4)
-
-    def _f0_to_events(self, f0, voiced, times, max_gap_hz=6):
-        """連続したピッチフレームをノートイベント(time, hz, dur)に変換"""
-        events = []
-        i = 0
-        while i < len(f0):
-            if voiced[i] and f0[i] is not None and not np.isnan(f0[i]):
-                start_t = times[i]
-                base_hz  = f0[i]
-                j = i + 1
-                while (j < len(f0) and voiced[j] and
-                       f0[j] is not None and not np.isnan(f0[j]) and
-                       abs(f0[j] - base_hz) < max_gap_hz):
-                    j += 1
-                end_t = times[min(j, len(times) - 1)]
-                dur = end_t - start_t
-                if dur >= 0.06:
-                    events.append((start_t, base_hz, min(dur, 4.0)))
-                i = j
-            else:
-                i += 1
-        return events
-
-    # ---- コード検出 -------------------------------------
-
-    def _chords(self, yh, sr, beat_times):
-        self._log("コード解析中...", 50)
-        chroma = librosa.feature.chroma_cqt(y=yh, sr=sr, hop_length=HOP)
-        NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        TEMPLATES = {
-            "maj":  [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0],
-            "min":  [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-            "dom7": [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0],
-        }
-        beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=HOP)
-        events = []
-        for idx, bf in enumerate(beat_frames):
-            end = (beat_frames[idx + 1]
-                   if idx + 1 < len(beat_frames)
-                   else min(bf + 8, chroma.shape[1] - 1))
-            if bf >= chroma.shape[1]:
-                break
-            cv = np.mean(chroma[:, bf: end + 1], axis=1)
-            cv = cv / (cv.max() + 1e-9)
-            best, chord = -1, ("C", "maj")
-            for root in range(12):
-                for q, tmpl in TEMPLATES.items():
-                    s = float(np.dot(cv, np.roll(tmpl, root)))
-                    if s > best:
-                        best, chord = s, (NOTES[root], q)
-            next_t = (beat_times[idx + 1]
-                      if idx + 1 < len(beat_times)
-                      else beat_times[idx] + 0.5)
-            dur = max(next_t - beat_times[idx] - 0.02, 0.05)
-            events.append((beat_times[idx], chord[0], chord[1], dur))
-        return events
 
     # ---- ドラム検出 -------------------------------------
 
@@ -656,82 +597,6 @@ class EarCopyEngine:
         mid.tracks.append(dtrk)
         mid.save(path)
 
-    def _save_midi(self, tempo, duration, mel, bass, chords, drums, path):
-        mid = MidiFile(type=1, ticks_per_beat=480)
-        tpb = 480
-        us_per_beat = int(60_000_000 / tempo)
-
-        def abs_to_track(events_abs):
-            """(abs_tick, msg) リストをデルタ時刻に変換してトラックへ"""
-            track = MidiTrack()
-            events_abs.sort(key=lambda x: x[0])
-            prev = 0
-            for tick, msg in events_abs:
-                delta = max(0, tick - prev)
-                msg.time = delta
-                track.append(msg)
-                prev = tick
-            return track
-
-        def secs_to_ticks(s):
-            return int(s * tempo / 60 * tpb)
-
-        def note_msgs(events, ch, prog):
-            evs = [
-                (0, MetaMessage("set_tempo", tempo=us_per_beat, time=0)),
-                (0, Message("program_change", channel=ch, program=prog, time=0)),
-            ]
-            for (start, hz, dur) in events:
-                note = int(np.clip(librosa.hz_to_midi(hz), 0, 127))
-                t0 = secs_to_ticks(start)
-                t1 = secs_to_ticks(start + dur)
-                evs.append((t0, Message("note_on",  channel=ch, note=note, velocity=88, time=0)))
-                evs.append((t1, Message("note_off", channel=ch, note=note, velocity=0,  time=0)))
-            return abs_to_track(evs)
-
-        # トラック0: テンポ
-        tempo_track = MidiTrack()
-        tempo_track.append(MetaMessage("set_tempo", tempo=us_per_beat, time=0))
-        mid.tracks.append(tempo_track)
-
-        # メロディー (ch0, Piano)
-        mid.tracks.append(note_msgs(mel, 0, 0))
-        # ベース (ch1, Acoustic Bass)
-        mid.tracks.append(note_msgs(bass, 1, 32))
-
-        # コード (ch2, Acoustic Guitar)
-        chord_evs = [
-            (0, MetaMessage("set_tempo", tempo=us_per_beat, time=0)),
-            (0, Message("program_change", channel=2, program=25, time=0)),
-        ]
-        SEMI = 2 ** (1 / 12)
-        CHORD_SEMI = {"maj": [0, 4, 7], "min": [0, 3, 7], "dom7": [0, 4, 7, 10]}
-        NOTE_HZ = self.NOTE_HZ
-        for (start, root, quality, dur) in chords:
-            root_hz = NOTE_HZ.get(root, 130.81)
-            for si in CHORD_SEMI.get(quality, [0, 4, 7]):
-                hz  = root_hz * (SEMI ** si)
-                note = int(np.clip(librosa.hz_to_midi(hz), 0, 127))
-                t0  = secs_to_ticks(start)
-                t1  = secs_to_ticks(start + dur)
-                chord_evs.append((t0, Message("note_on",  channel=2, note=note, velocity=70, time=0)))
-                chord_evs.append((t1, Message("note_off", channel=2, note=note, velocity=0,  time=0)))
-        mid.tracks.append(abs_to_track(chord_evs))
-
-        # ドラム (ch9)
-        DRUM_MAP = {"kick": 36, "snare": 38, "hihat": 42}
-        drum_evs = [
-            (0, MetaMessage("set_tempo", tempo=us_per_beat, time=0)),
-        ]
-        for (start, kind) in drums:
-            note = DRUM_MAP.get(kind, 38)
-            t0   = secs_to_ticks(start)
-            drum_evs.append((t0, Message("note_on",  channel=9, note=note, velocity=95, time=0)))
-            drum_evs.append((t0 + 30, Message("note_off", channel=9, note=note, velocity=0, time=0)))
-        mid.tracks.append(abs_to_track(drum_evs))
-
-        mid.save(path)
-
 
 # =====================================================
 # GUI
@@ -753,7 +618,7 @@ class App:
         else:
             self.root = tk.Tk()
 
-        self.root.title("耳コピ自動生成ツール")
+        self.root.title("耳コピ自動生成ツール v5.0")
         self.root.geometry("620x520")
         self.root.configure(bg=self.BG)
         self.root.resizable(False, False)
@@ -771,7 +636,7 @@ class App:
         r = self.root
 
         # タイトル
-        tk.Label(r, text="耳コピ自動生成ツール",
+        tk.Label(r, text="耳コピ自動生成ツール v5.0",
                  font=("Helvetica", 20, "bold"),
                  bg=self.BG, fg=self.ACCENT).pack(pady=(20, 4))
         tk.Label(r, text="MP3をAIが分析し、全パートを自動トランスクリプション → 再合成",
@@ -927,13 +792,60 @@ class App:
 
 
 # =====================================================
+# CLIモード
+# =====================================================
+
+def _run_cli(args):
+    """コマンドライン引数で直接処理を実行する"""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="耳コピ自動生成ツール v5.0 - MP3をAI分析して耳コピ音源を自動生成"
+    )
+    parser.add_argument("input", help="入力音楽ファイル（MP3/WAV/M4A/FLAC）")
+    parser.add_argument("-o", "--output", help="出力MP3パス（省略時: 同じフォルダに 耳コピ_*.mp3）")
+    opts = parser.parse_args(args)
+
+    inp = Path(opts.input)
+    if not inp.exists():
+        print(f"エラー: ファイルが見つかりません: {inp}")
+        sys.exit(1)
+
+    if opts.output:
+        out = opts.output
+    else:
+        out = str(inp.parent / f"耳コピ_{inp.stem}.mp3")
+
+    print(f"入力: {inp}")
+    print(f"出力: {out}")
+    print()
+
+    engine = EarCopyEngine()
+    ok, result = engine.process(str(inp), out)
+
+    if ok:
+        midi_path = str(Path(out).with_suffix(".mid"))
+        print(f"\n完了！")
+        print(f"  MP3: {out}")
+        if Path(midi_path).exists():
+            print(f"  MIDI: {midi_path}")
+    else:
+        print(f"\nエラー:\n{result}")
+        sys.exit(1)
+
+
+# =====================================================
 # エントリーポイント
 # =====================================================
 
 if __name__ == "__main__":
-    try:
-        App().run()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        input("\nエラーが発生しました。上のメッセージをコピーしてください。\nEnterキーで終了...")
+    # コマンドライン引数があればCLIモード、なければGUIモード
+    if len(sys.argv) > 1:
+        _run_cli(sys.argv[1:])
+    else:
+        try:
+            _init_gui()
+            App().run()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            input("\nエラーが発生しました。上のメッセージをコピーしてください。\nEnterキーで終了...")
