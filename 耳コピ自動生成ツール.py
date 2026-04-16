@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-耳コピ自動生成ツール v5.0
+耳コピ自動生成ツール v6.0
 MP3をドラッグ&ドロップするだけで耳コピ音源（MIDI再合成）を自動作成
+16楽器フルアレンジ + 高精度CQT/pyin複合検出
 
 必要環境: Python 3.8+
 初回起動時に依存パッケージを自動インストールします
@@ -210,7 +211,28 @@ SEMI = 2 ** (1 / 12)
 
 
 class EarCopyEngine:
-    """音楽分析 → 耳コピ音源生成エンジン v5.0（多声部・多楽器・倍音除去）"""
+    """v6.0 - 最高精度・15楽器フルオーケストラ耳コピエンジン"""
+
+    MIDI_MAP = {
+        'piano': (0, 0), 'e_piano': (1, 4), 'glockenspiel': (2, 9),
+        'organ': (3, 19), 'guitar_nylon': (4, 24), 'guitar_clean': (5, 27),
+        'bass': (6, 33), 'violin': (7, 40), 'viola': (8, 41),
+        'cello': (10, 42), 'strings': (11, 48), 'choir': (12, 52),
+        'trumpet': (13, 56), 'flute': (14, 73), 'pad': (15, 89),
+    }
+    GAIN = {
+        'piano': 1.0, 'e_piano': 0.7, 'glockenspiel': 0.5,
+        'organ': 0.5, 'guitar_nylon': 0.7, 'guitar_clean': 0.6,
+        'bass': 0.9, 'violin': 0.8, 'viola': 0.7, 'cello': 0.8,
+        'strings': 0.5, 'choir': 0.4, 'trumpet': 0.6,
+        'flute': 0.6, 'pad': 0.4,
+    }
+    CHORD_IV = {
+        'maj': [0,4,7], 'min': [0,3,7], 'dom7': [0,4,7,10],
+        'min7': [0,3,7,10], 'maj7': [0,4,7,11], 'dim': [0,3,6],
+    }
+    NOTE_MIDI = {'C':0,'C#':1,'D':2,'D#':3,'E':4,'F':5,
+                 'F#':6,'G':7,'G#':8,'A':9,'A#':10,'B':11}
 
     def __init__(self, on_progress=None):
         self._cb = on_progress
@@ -311,23 +333,177 @@ class EarCopyEngine:
                 events.append((times[sf_], dur, mn, vel))
         return events
 
-    def _assign_parts(self, notes):
-        """検出ノートを音域別に7パートへ振り分け"""
-        parts = {'melody': [], 'flute': [], 'violin': [],
-                 'cello': [], 'bass': [], 'guitar': [], 'pad': []}
-        for (t, dur, midi, vel) in notes:
-            if midi >= 72:
-                parts['melody'].append((t, dur, midi, vel))
-                if vel < 85:
-                    parts['flute'].append((t, dur, midi, int(vel * 0.5)))
-            elif midi >= 60:
-                parts['violin'].append((t, dur, midi, vel))
-                parts['guitar'].append((t, dur, midi, int(vel * 0.4)))
-            elif midi >= 48:
-                parts['cello'].append((t, dur, midi, vel))
-                parts['pad'].append((t, dur, midi, int(vel * 0.3)))
+    # ---- pyin メロディ検出 --------------------------------
+
+    def _detect_melody(self, y_h, sr):
+        self._log("  メロディ解析中 (pyin)...", 33)
+        f0, voiced, _ = librosa.pyin(
+            y_h, fmin=librosa.note_to_hz("C2"),
+            fmax=librosa.note_to_hz("C7"), sr=sr, hop_length=HOP)
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
+        return self._f0_to_notes(f0, voiced, times, 8)
+
+    # ---- pyin ベース検出 ----------------------------------
+
+    def _detect_bass(self, y_h, sr):
+        self._log("  ベースライン解析中...", 37)
+        nyq = sr / 2
+        b, a = butter(4, min(250 / nyq, 0.99), btype="low")
+        yb = filtfilt(b, a, y_h)
+        f0, voiced, _ = librosa.pyin(
+            yb, fmin=librosa.note_to_hz("C1"),
+            fmax=librosa.note_to_hz("C3"), sr=sr, hop_length=HOP * 2)
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP * 2)
+        return self._f0_to_notes(f0, voiced, times, 4)
+
+    def _f0_to_notes(self, f0, voiced, times, max_gap_hz):
+        events = []
+        i = 0
+        while i < len(f0):
+            if voiced[i] and f0[i] is not None and not np.isnan(f0[i]):
+                start_t = times[i]
+                base_hz = f0[i]
+                hz_list = [base_hz]
+                j = i + 1
+                while (j < len(f0) and voiced[j] and
+                       f0[j] is not None and not np.isnan(f0[j]) and
+                       abs(f0[j] - base_hz) < max_gap_hz):
+                    hz_list.append(f0[j])
+                    j += 1
+                dur = times[min(j, len(times)-1)] - start_t
+                if dur >= 0.06:
+                    midi = int(np.clip(np.round(
+                        librosa.hz_to_midi(np.mean(hz_list))), 0, 127))
+                    vel = min(int(80 + dur * 10), 120)
+                    events.append((start_t, min(dur, 4.0), midi, vel))
+                i = j
             else:
-                parts['bass'].append((t, dur, midi, vel))
+                i += 1
+        return events
+
+    # ---- コード検出 ----------------------------------------
+
+    def _detect_chords(self, y_h, sr, beat_times):
+        self._log("  コード解析中...", 42)
+        if len(beat_times) == 0:
+            return []
+        chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, hop_length=HOP)
+        NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+        TEMPLATES = {
+            'maj': [1,0,0,0,1,0,0,1,0,0,0,0],
+            'min': [1,0,0,1,0,0,0,1,0,0,0,0],
+            'dom7':[1,0,0,0,1,0,0,1,0,0,1,0],
+            'min7':[1,0,0,1,0,0,0,1,0,0,1,0],
+            'dim': [1,0,0,1,0,0,1,0,0,0,0,0],
+        }
+        beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=HOP)
+        events = []
+        for idx, bf in enumerate(beat_frames):
+            end = (beat_frames[idx+1] if idx+1 < len(beat_frames)
+                   else min(bf+8, chroma.shape[1]-1))
+            if bf >= chroma.shape[1]:
+                break
+            cv = np.mean(chroma[:, bf:end+1], axis=1)
+            cv = cv / (cv.max() + 1e-9)
+            best, chord = -1, ("C", "maj")
+            for root in range(12):
+                for q, tmpl in TEMPLATES.items():
+                    s = float(np.dot(cv, np.roll(tmpl, root)))
+                    if s > best:
+                        best, chord = s, (NOTES[root], q)
+            next_t = (beat_times[idx+1] if idx+1 < len(beat_times)
+                      else beat_times[idx] + 0.5)
+            dur = max(next_t - beat_times[idx] - 0.02, 0.05)
+            events.append((beat_times[idx], chord[0], chord[1], dur))
+        return events
+
+    def _chord_to_midis(self, root, quality, octave=4):
+        root_midi = self.NOTE_MIDI.get(root, 0) + 12 * (octave + 1)
+        return [root_midi + iv for iv in self.CHORD_IV.get(quality, [0,4,7])]
+
+    # ---- 15楽器スマート振り分け ----------------------------
+
+    def _smart_assign(self, cqt_notes, melody, bass, chords, beat_times):
+        self._log("15パートに振り分け中...", 55)
+        parts = {name: [] for name in self.MIDI_MAP}
+        mel_set = set()
+        bass_set = set()
+
+        # 1. メロディ → ピアノ + ダブリング
+        for (t, dur, midi, vel) in melody:
+            parts['piano'].append((t, dur, midi, vel))
+            mel_set.add((round(t, 2), midi))
+            if midi >= 80:
+                parts['flute'].append((t, dur, midi, int(vel * 0.4)))
+            elif midi >= 68:
+                parts['violin'].append((t, dur, midi, int(vel * 0.4)))
+            else:
+                parts['e_piano'].append((t, dur, midi, int(vel * 0.35)))
+
+        # 2. ベース → ベース + チェロ
+        for (t, dur, midi, vel) in bass:
+            parts['bass'].append((t, dur, midi, int(vel * 0.95)))
+            bass_set.add((round(t, 2), midi))
+            if midi + 12 < 60:
+                parts['cello'].append((t, dur, midi + 12, int(vel * 0.45)))
+
+        # 3. コード → ギター + ストリングス + パッド + オルガン
+        prev_chord = None
+        for (t, root, quality, dur) in chords:
+            c4 = self._chord_to_midis(root, quality, 4)
+            c3 = self._chord_to_midis(root, quality, 3)
+            for cm in c4:
+                parts['guitar_nylon'].append((t, dur * 0.9, cm, 60))
+                parts['strings'].append((t, dur, cm, 42))
+            for cm in c3:
+                parts['pad'].append((t, dur, cm, 32))
+            cur = (root, quality)
+            if cur != prev_chord:
+                for cm in c3:
+                    parts['organ'].append((t, dur, cm, 28))
+            prev_chord = cur
+
+        # 4. CQT残り → 音域で分配
+        for (t, dur, midi, vel) in cqt_notes:
+            key = (round(t, 2), midi)
+            if key in mel_set or key in bass_set:
+                continue
+            skip = False
+            for mt, mm in mel_set:
+                if abs(round(t, 2) - mt) < 0.05 and abs(midi - mm) <= 2:
+                    skip = True
+                    break
+            if skip:
+                continue
+            if midi >= 84:
+                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.35)))
+            elif midi >= 72:
+                if dur >= 0.4:
+                    parts['violin'].append((t, dur, midi, int(vel * 0.5)))
+                    parts['choir'].append((t, dur, midi, int(vel * 0.2)))
+                else:
+                    parts['e_piano'].append((t, dur, midi, int(vel * 0.5)))
+            elif midi >= 60:
+                if dur >= 0.4:
+                    parts['viola'].append((t, dur, midi, int(vel * 0.5)))
+                else:
+                    parts['guitar_clean'].append((t, dur, midi, int(vel * 0.45)))
+            elif midi >= 48:
+                if dur >= 0.4:
+                    parts['cello'].append((t, dur, midi, int(vel * 0.55)))
+                else:
+                    parts['guitar_clean'].append((t, dur, midi, int(vel * 0.4)))
+
+        # 5. 強拍トランペットアクセント
+        if beat_times is not None and len(melody) > 0:
+            for i, bt in enumerate(beat_times):
+                if i % 4 != 0:
+                    continue
+                for (mt, md, mm, mv) in melody:
+                    if abs(mt - bt) < 0.08 and mm >= 60:
+                        parts['trumpet'].append((mt, min(md, 0.4), mm, int(mv * 0.3)))
+                        break
+
         return parts
 
     # ---- メイン処理 --------------------------------------
@@ -340,31 +516,42 @@ class EarCopyEngine:
             tempo, beats = self._tempo(y, sr)
             self._log(f"テンポ: {tempo:.1f} BPM", 20)
 
-            self._log("全音符を検出中（CQT多声部）...", 25)
-            all_notes = self._detect_all_notes(y_h, sr)
-            self._log(f"検出: {len(all_notes)} 音符", 38)
+            # 4層検出
+            self._log("CQT多声部解析中...", 24)
+            cqt_notes = self._detect_all_notes(y_h, sr)
+            self._log(f"  CQT: {len(cqt_notes)} 音符", 32)
 
-            self._log("7パートに振り分け中...", 40)
-            parts = self._assign_parts(all_notes)
+            melody = self._detect_melody(y_h, sr)
+            self._log(f"  メロディ: {len(melody)} 音符", 35)
+
+            bass = self._detect_bass(y_h, sr)
+            self._log(f"  ベース: {len(bass)} 音符", 40)
+
+            chords = self._detect_chords(y_h, sr, beats)
+            self._log(f"  コード: {len(chords)} 進行", 45)
 
             self._log("ドラム解析中...", 48)
             drum_events = self._drums(y_p, sr)
-            self._log(f"ドラム: {len(drum_events)} イベント", 55)
+            self._log(f"  ドラム: {len(drum_events)} イベント", 52)
 
-            self._log("7楽器で合成中...", 60)
+            parts = self._smart_assign(cqt_notes, melody, bass, chords, beats)
+            total = sum(len(v) for v in parts.values())
+            self._log(f"  全パート合計: {total} ノート（15楽器）", 58)
+
+            self._log("15楽器+ドラムで合成中...", 60)
             n = int((duration + 2.0) * SR)
             audio = self._synth_parts(parts, n) * 0.75
-            audio += self._synth_drums(drum_events, n) * 0.55
+            audio += self._synth_drums(drum_events, n) * 0.50
             peak = np.max(np.abs(audio))
             if peak > 0:
-                audio = (audio / peak * 0.9).astype(np.float32)
+                audio = (audio / peak * 0.92).astype(np.float32)
 
             self._log("MP3を保存中...", 90)
             self._save_mp3(audio, output_path)
 
             self._log("MIDIを保存中...", 95)
             midi_path = str(Path(output_path).with_suffix(".mid"))
-            self._save_midi_v4(parts, drum_events, tempo, midi_path)
+            self._save_midi(parts, drum_events, tempo, midi_path)
 
             self._log("完了！", 100)
             return True, output_path
@@ -452,59 +639,111 @@ class EarCopyEngine:
             e[n-ri:] *= np.linspace(1, 0, ri)
         return e
 
+    # ---- 15楽器シンセサイザー --------------------------------
+
     def _tone_piano(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
-        sig = sum((0.75**h) * np.sin(2*np.pi*hz*(h+1)*t) for h in range(8) if hz*(h+1) < SR/2)
-        return sig * np.exp(-t * (1.5 + hz/600)) * self._env(t, 0.003, 0.08, 0.5, 0.12) * (vel/127) * 0.25
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        sig = sum((0.75**h)*np.sin(2*np.pi*hz*(h+1)*t) for h in range(8) if hz*(h+1)<SR/2)
+        return sig * np.exp(-t*(1.5+hz/600)) * self._env(t,0.003,0.08,0.5,0.12) * (vel/127)*0.25
 
-    def _tone_flute(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
-        vib = 1 + 0.003 * np.sin(2*np.pi*5.5*t)
-        sig = np.sin(2*np.pi*hz*vib*t) + 0.1*np.sin(2*np.pi*hz*2*vib*t)
-        sig += np.random.randn(len(t)) * 0.02 * np.exp(-t*3)
-        return sig * self._env(t, 0.06, 0.1, 0.8, 0.15) * (vel/127) * 0.18
+    def _tone_e_piano(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        mod = np.sin(2*np.pi*hz*t) * (vel/127) * 3
+        sig = np.sin(2*np.pi*hz*t + mod) + 0.3*np.sin(2*np.pi*hz*2*t)*np.exp(-t*4)
+        return sig * np.exp(-t*2) * self._env(t,0.002,0.1,0.4,0.15) * (vel/127)*0.22
 
-    def _tone_violin(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
-        vib = 1 + 0.004 * np.sin(2*np.pi*5.8*t)
-        sig = sum(((-1)**h * 0.7**h) * np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(6) if hz*(h+1) < SR/2)
-        return sig * self._env(t, 0.05, 0.08, 0.85, 0.12) * (vel/127) * 0.20
+    def _tone_glockenspiel(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(max(dur, 0.8))
+        sig = (np.sin(2*np.pi*hz*t) + 0.6*np.sin(2*np.pi*hz*2.76*t)
+               + 0.3*np.sin(2*np.pi*hz*5.4*t) + 0.1*np.sin(2*np.pi*hz*8.93*t))
+        return sig * np.exp(-t*3) * self._env(t,0.001,0.02,0.3,0.2) * (vel/127)*0.15
 
-    def _tone_cello(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
-        vib = 1 + 0.003 * np.sin(2*np.pi*4.5*t)
-        sig = sum((0.8**h) * np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(7) if hz*(h+1) < SR/2)
-        return sig * self._env(t, 0.04, 0.1, 0.8, 0.15) * (vel/127) * 0.22
+    def _tone_organ(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        sig = (0.8*np.sin(2*np.pi*hz*0.5*t) + np.sin(2*np.pi*hz*t)
+               + 0.6*np.sin(2*np.pi*hz*1.5*t) + 0.8*np.sin(2*np.pi*hz*2*t)
+               + 0.3*np.sin(2*np.pi*hz*3*t) + 0.5*np.sin(2*np.pi*hz*4*t))
+        return sig/4 * self._env(t,0.01,0.02,0.9,0.05) * (vel/127)*0.18
+
+    def _tone_guitar_nylon(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        sig = sum((0.7**h)*np.sin(2*np.pi*hz*(h+1)*t) for h in range(6) if hz*(h+1)<SR/2)
+        return sig * np.exp(-t*2.5) * self._env(t,0.002,0.06,0.4,0.08) * (vel/127)*0.20
+
+    def _tone_guitar_clean(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        sig = sum((0.65**h)*np.sin(2*np.pi*hz*(h+1)*t+h*0.2) for h in range(8) if hz*(h+1)<SR/2)
+        return sig * np.exp(-t*2.0) * self._env(t,0.001,0.04,0.45,0.1) * (vel/127)*0.18
 
     def _tone_bass(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
-        sig = sum((0.85**h) * np.sin(2*np.pi*hz*(h+1)*t) for h in range(5) if hz*(h+1) < SR/2)
-        return sig * np.exp(-t*1.4) * self._env(t, 0.008, 0.05, 0.75, 0.1) * (vel/127) * 0.35
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        sig = np.sin(2*np.pi*hz*t) + 0.5*np.sin(2*np.pi*hz*2*t) + 0.2*np.sin(2*np.pi*hz*3*t)
+        return sig * np.exp(-t*1.4) * self._env(t,0.008,0.05,0.75,0.1) * (vel/127)*0.35
 
-    def _tone_guitar(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
-        sig = sum((0.7**h) * np.sin(2*np.pi*hz*(h+1)*t + h*0.3) for h in range(6) if hz*(h+1) < SR/2)
-        return sig * np.exp(-t*2.5) * self._env(t, 0.002, 0.06, 0.4, 0.08) * (vel/127) * 0.20
+    def _tone_violin(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.004*np.sin(2*np.pi*5.8*t)
+        sig = sum(((-1)**h*0.7**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(6) if hz*(h+1)<SR/2)
+        return sig * self._env(t,0.05,0.08,0.85,0.12) * (vel/127)*0.20
+
+    def _tone_viola(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.003*np.sin(2*np.pi*5.2*t)
+        sig = sum(((-1)**h*0.75**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(5) if hz*(h+1)<SR/2)
+        return sig * self._env(t,0.06,0.1,0.8,0.15) * (vel/127)*0.18
+
+    def _tone_cello(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.003*np.sin(2*np.pi*4.5*t)
+        sig = sum((0.8**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(7) if hz*(h+1)<SR/2)
+        return sig * self._env(t,0.04,0.1,0.8,0.15) * (vel/127)*0.22
+
+    def _tone_strings(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.003*np.sin(2*np.pi*5*t)
+        s1 = sum((0.7**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(5) if hz*(h+1)<SR/2)
+        s2 = sum((0.7**h)*np.sin(2*np.pi*hz*1.002*(h+1)*vib*t) for h in range(5) if hz*1.002*(h+1)<SR/2)
+        s3 = sum((0.7**h)*np.sin(2*np.pi*hz*0.998*(h+1)*vib*t) for h in range(5) if hz*0.998*(h+1)<SR/2)
+        return (s1+s2+s3)/3 * self._env(t,0.12,0.15,0.7,0.2) * (vel/127)*0.15
+
+    def _tone_choir(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.005*np.sin(2*np.pi*5.5*t)
+        sig = (np.sin(2*np.pi*hz*vib*t) + 0.5*np.sin(2*np.pi*hz*2*vib*t)
+               + 0.3*np.sin(2*np.pi*hz*3*vib*t) + 0.4*np.sin(2*np.pi*hz*1.003*vib*t)
+               + 0.4*np.sin(2*np.pi*hz*0.997*vib*t))
+        return sig/3 * self._env(t,0.2,0.15,0.65,0.25) * (vel/127)*0.12
+
+    def _tone_trumpet(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.002*np.sin(2*np.pi*5.5*t)
+        sig = (np.sin(2*np.pi*hz*vib*t) + 0.8*np.sin(2*np.pi*hz*2*vib*t)
+               + 0.6*np.sin(2*np.pi*hz*3*vib*t) + 0.5*np.sin(2*np.pi*hz*4*vib*t)
+               + 0.3*np.sin(2*np.pi*hz*5*vib*t))
+        return sig/3 * self._env(t,0.03,0.06,0.85,0.08) * (vel/127)*0.20
+
+    def _tone_flute(self, midi, dur, vel):
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
+        vib = 1 + 0.003*np.sin(2*np.pi*5.5*t)
+        sig = np.sin(2*np.pi*hz*vib*t) + 0.1*np.sin(2*np.pi*hz*2*vib*t)
+        sig += np.random.randn(len(t)) * 0.02 * np.exp(-t*3)
+        return sig * self._env(t,0.06,0.1,0.8,0.15) * (vel/127)*0.18
 
     def _tone_pad(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69)
-        t = self._t(dur)
+        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
         s1 = np.sin(2*np.pi*hz*t)
         s2 = np.sin(2*np.pi*hz*1.003*t)
         s3 = np.sin(2*np.pi*hz*0.997*t)
-        return (s1+s2+s3)/3 * self._env(t, 0.15, 0.2, 0.6, 0.3) * (vel/127) * 0.12
+        return (s1+s2+s3)/3 * self._env(t,0.15,0.2,0.6,0.3) * (vel/127)*0.12
 
-    TONE_FN = {'melody': '_tone_piano', 'flute': '_tone_flute',
-               'violin': '_tone_violin', 'cello': '_tone_cello',
-               'bass': '_tone_bass', 'guitar': '_tone_guitar', 'pad': '_tone_pad'}
-    GAIN = {'melody': 1.0, 'flute': 0.6, 'violin': 0.8, 'cello': 0.8,
-            'bass': 0.9, 'guitar': 0.7, 'pad': 0.4}
+    TONE_FN = {
+        'piano':'_tone_piano', 'e_piano':'_tone_e_piano',
+        'glockenspiel':'_tone_glockenspiel', 'organ':'_tone_organ',
+        'guitar_nylon':'_tone_guitar_nylon', 'guitar_clean':'_tone_guitar_clean',
+        'bass':'_tone_bass', 'violin':'_tone_violin', 'viola':'_tone_viola',
+        'cello':'_tone_cello', 'strings':'_tone_strings', 'choir':'_tone_choir',
+        'trumpet':'_tone_trumpet', 'flute':'_tone_flute', 'pad':'_tone_pad',
+    }
 
     def _synth_parts(self, parts, n):
         buf = np.zeros(n)
@@ -567,23 +806,25 @@ class EarCopyEngine:
         seg.export(path, format="mp3", bitrate="192k")
         os.unlink(tmp)
 
-    def _save_midi_v4(self, parts, drums, tempo, path):
+    def _save_midi(self, parts, drums, tempo, path):
         mid = MidiFile(type=1, ticks_per_beat=480)
         tpb = 480
         us = int(60_000_000 / tempo)
-        PROG = {'melody': 0, 'flute': 73, 'violin': 40, 'cello': 42,
-                'bass': 32, 'guitar': 25, 'pad': 89}
         def s2t(s): return int(s * tempo / 60 * tpb)
         tt = MidiTrack()
         tt.append(MetaMessage('set_tempo', tempo=us, time=0))
         mid.tracks.append(tt)
-        for ch, (name, evts) in enumerate(parts.items()):
-            if ch >= 9: ch += 1
-            evs = [(0, Message('program_change', channel=ch, program=PROG.get(name, 0), time=0))]
+        for name, evts in parts.items():
+            if not evts:
+                continue
+            ch, prog = self.MIDI_MAP[name]
+            evs = [(0, Message('program_change', channel=ch, program=prog, time=0))]
             for (t, dur, midi, vel) in evts:
+                note = int(np.clip(midi, 0, 127))
+                v = min(max(vel, 1), 127)
                 t0, t1 = s2t(t), s2t(t + dur)
-                evs.append((t0, Message('note_on', channel=ch, note=int(np.clip(midi,0,127)), velocity=min(vel,127), time=0)))
-                evs.append((t1, Message('note_off', channel=ch, note=int(np.clip(midi,0,127)), velocity=0, time=0)))
+                evs.append((t0, Message('note_on', channel=ch, note=note, velocity=v, time=0)))
+                evs.append((t1, Message('note_off', channel=ch, note=note, velocity=0, time=0)))
             trk = MidiTrack()
             evs.sort(key=lambda x: x[0])
             prev = 0
@@ -599,14 +840,15 @@ class EarCopyEngine:
             t0 = s2t(t)
             devs.append((t0, Message('note_on', channel=9, note=n, velocity=95, time=0)))
             devs.append((t0+30, Message('note_off', channel=9, note=n, velocity=0, time=0)))
-        dtrk = MidiTrack()
-        devs.sort(key=lambda x: x[0])
-        prev = 0
-        for tick, msg in devs:
-            msg.time = max(0, tick - prev)
-            dtrk.append(msg)
-            prev = tick
-        mid.tracks.append(dtrk)
+        if devs:
+            dtrk = MidiTrack()
+            devs.sort(key=lambda x: x[0])
+            prev = 0
+            for tick, msg in devs:
+                msg.time = max(0, tick - prev)
+                dtrk.append(msg)
+                prev = tick
+            mid.tracks.append(dtrk)
         mid.save(path)
 
 
@@ -630,7 +872,7 @@ class App:
         else:
             self.root = tk.Tk()
 
-        self.root.title("耳コピ自動生成ツール v5.0")
+        self.root.title("耳コピ自動生成ツール v6.0")
         self.root.geometry("620x520")
         self.root.configure(bg=self.BG)
         self.root.resizable(False, False)
@@ -648,10 +890,10 @@ class App:
         r = self.root
 
         # タイトル
-        tk.Label(r, text="耳コピ自動生成ツール v5.0",
+        tk.Label(r, text="耳コピ自動生成ツール v6.0",
                  font=("Helvetica", 20, "bold"),
                  bg=self.BG, fg=self.ACCENT).pack(pady=(20, 4))
-        tk.Label(r, text="MP3をAIが分析し、全パートを自動トランスクリプション → 再合成",
+        tk.Label(r, text="MP3をAI分析 → 15楽器フルアレンジで自動トランスクリプション",
                  font=("Helvetica", 9), bg=self.BG, fg=self.FG2).pack()
 
         # ドロップゾーン
@@ -811,7 +1053,7 @@ def _run_cli(args):
     """コマンドライン引数で直接処理を実行する"""
     import argparse
     parser = argparse.ArgumentParser(
-        description="耳コピ自動生成ツール v5.0 - MP3をAI分析して耳コピ音源を自動生成"
+        description="耳コピ自動生成ツール v6.0 - MP3をAI分析して耳コピ音源を自動生成"
     )
     parser.add_argument("input", help="入力音楽ファイル（MP3/WAV/M4A/FLAC）")
     parser.add_argument("-o", "--output", help="出力MP3パス（省略時: 同じフォルダに 耳コピ_*.mp3）")
