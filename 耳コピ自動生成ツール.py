@@ -1373,6 +1373,7 @@ class EarCopyEngine:
         if sf2 is None:
             self._log("  SoundFont が見つかりません", 84)
             return None
+        self._log(f"  SoundFont: {Path(sf2).name}", 84)
 
         # 2. FluidSynth CLI バイナリを確保
         fs_bin = _ensure_fluidsynth_cli(lambda m: self._log(m, 84))
@@ -1380,44 +1381,91 @@ class EarCopyEngine:
             self._log("  FluidSynth CLI が見つかりません", 84)
             return None
 
-        # 3. CLI で MIDI → WAV レンダリング
-        self._log("  FluidSynth でレンダリング中 (サンプル音源使用)...", 85)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            tmp_wav = f.name
+        # 3. Windows 日本語パス問題回避: ASCIIのみの一時フォルダで作業
+        work_dir = Path(tempfile.gettempdir()) / "earcopy_fs"
+        work_dir.mkdir(exist_ok=True)
+        ascii_midi = work_dir / "in.mid"
+        ascii_wav = work_dir / "out.wav"
+        ascii_sf2 = work_dir / "font.sf2"
         try:
-            cmd = [
-                fs_bin, "-ni", sf2, midi_path,
-                "-F", tmp_wav,
-                "-r", str(SR),
-                "-g", "0.8",    # gain
-                "-R", "1",      # reverb on
-                "-C", "1",      # chorus on
-            ]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300
+            shutil.copy(midi_path, ascii_midi)
+            # SF2 は容量が大きいので symlink 優先、失敗時はコピー
+            if ascii_sf2.exists():
+                ascii_sf2.unlink()
+            try:
+                ascii_sf2.symlink_to(sf2)
+            except (OSError, NotImplementedError):
+                shutil.copy(sf2, ascii_sf2)
+        except Exception as e:
+            self._log(f"  ファイルコピー失敗: {e}", -1)
+            return None
+
+        # 4. FluidSynth CLI 実行（正しいフラグ順序）
+        self._log("  FluidSynth でレンダリング中 (サンプル音源使用)...", 85)
+        # 重要: 全フラグを positional args (sf2, mid) の前に置く
+        cmd = [
+            fs_bin,
+            "-ni",                       # non-interactive
+            "-F", str(ascii_wav),         # output file (必ず positional の前)
+            "-r", str(SR),                # sample rate
+            "-g", "0.9",                  # gain
+            "-R", "1",                    # reverb
+            "-C", "1",                    # chorus
+            "-T", "wav",                  # output format
+            "-a", "file",                 # audio driver: file-only (no realtime)
+            str(ascii_sf2),               # soundfont (positional)
+            str(ascii_midi),              # midi file (positional)
+        ]
+
+        # タイムアウト: 曲の長さの10倍 or 最低15分
+        timeout_sec = max(900, int(duration * 10))
+
+        try:
+            # stdout/stderr を捕捉しつつ、stderr末尾を取る
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout or "unknown")[-300:]
-                self._log(f"  FluidSynth CLI エラー:\n    {err}", -1)
-                return None
-            if not Path(tmp_wav).exists() or Path(tmp_wav).stat().st_size < 1000:
-                self._log("  FluidSynth: WAV出力が空です", -1)
+            try:
+                out, err = proc.communicate(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                self._log(f"  FluidSynth: タイムアウト ({timeout_sec}秒)", -1)
                 return None
 
-            audio, _ = librosa.load(tmp_wav, sr=SR, mono=True)
+            if proc.returncode != 0:
+                tail = (err or out or "no output").strip().splitlines()[-6:]
+                self._log(f"  FluidSynth エラー (rc={proc.returncode}):", -1)
+                for line in tail:
+                    self._log(f"    {line}", -1)
+                return None
+
+            if not ascii_wav.exists() or ascii_wav.stat().st_size < 1000:
+                self._log(f"  FluidSynth: WAV出力が空 ({ascii_wav.stat().st_size if ascii_wav.exists() else 0} bytes)", -1)
+                if err:
+                    for line in err.strip().splitlines()[-4:]:
+                        self._log(f"    {line}", -1)
+                return None
+
+            audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=True)
             self._log(f"  ✓ FluidSynth レンダリング完了 ({len(audio)/SR:.1f}秒)", 88)
             return audio
-        except subprocess.TimeoutExpired:
-            self._log("  FluidSynth: タイムアウト (5分)", -1)
-            return None
         except Exception as e:
-            self._log(f"  FluidSynth 失敗: {e}", -1)
+            self._log(f"  FluidSynth 実行エラー: {e}", -1)
             return None
         finally:
-            try:
-                os.unlink(tmp_wav)
-            except Exception:
-                pass
+            # 一時ファイル掃除
+            for p in (ascii_midi, ascii_wav):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
 
     # ---- ブレンド＆マスタリング ---------------------------
 
