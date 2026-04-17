@@ -188,7 +188,7 @@ def _init_gui():
         HAS_DND = True
         TkinterDnD = _TkDnD
         DND_FILES = _dnd
-    except Exception:
+    except ImportError:
         HAS_DND = False
 
 
@@ -442,22 +442,6 @@ def _prompt_sf2_manually(log=print):
         pass
     return None
 
-
-def _setup_fluidsynth():
-    """pyfluidsynth の利用可否を判定する"""
-    if not _importable("fluidsynth"):
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "pyfluidsynth", "-q"],
-                stderr=subprocess.DEVNULL
-            )
-        except subprocess.CalledProcessError:
-            return False
-    try:
-        import fluidsynth  # noqa
-        return True
-    except Exception:
-        return False
 
 
 # =====================================================
@@ -1403,25 +1387,26 @@ class EarCopyEngine:
         # 4. FluidSynth CLI 実行（正しいフラグ順序）
         self._log("  FluidSynth でレンダリング中 (サンプル音源使用)...", 85)
         # 重要: 全フラグを positional args (sf2, mid) の前に置く
-        cmd = [
-            fs_bin,
-            "-ni",                       # non-interactive
-            "-F", str(ascii_wav),         # output file (必ず positional の前)
-            "-r", str(SR),                # sample rate
-            "-g", "0.9",                  # gain
-            "-R", "1",                    # reverb
-            "-C", "1",                    # chorus
-            "-T", "wav",                  # output format
-            "-a", "file",                 # audio driver: file-only (no realtime)
-            str(ascii_sf2),               # soundfont (positional)
-            str(ascii_midi),              # midi file (positional)
-        ]
-
         # タイムアウト: 曲の長さの10倍 or 最低15分
         timeout_sec = max(900, int(duration * 10))
 
-        try:
-            # stdout/stderr を捕捉しつつ、stderr末尾を取る
+        def _build_cmd(use_file_driver: bool) -> list:
+            base = [
+                fs_bin,
+                "-ni",
+                "-F", str(ascii_wav),
+                "-r", str(SR),
+                "-g", "0.9",
+                "-R", "1",
+                "-C", "1",
+                "-T", "wav",
+            ]
+            if use_file_driver:
+                base += ["-a", "file"]  # file-only driver (一部ビルドで非対応)
+            return base + [str(ascii_sf2), str(ascii_midi)]
+
+        def _run_fluidsynth(cmd: list):
+            """(returncode, out, err) を返す。タイムアウト時は (None, None, None)。"""
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1432,15 +1417,31 @@ class EarCopyEngine:
             )
             try:
                 out, err = proc.communicate(timeout=timeout_sec)
+                return proc.returncode, out, err
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate()
                 self._log(f"  FluidSynth: タイムアウト ({timeout_sec}秒)", -1)
-                return None
+                return None, None, None
 
-            if proc.returncode != 0:
+        try:
+            # まず -a file ドライバで試行（WAV ファイル出力専用モード）
+            rc, out, err = _run_fluidsynth(_build_cmd(use_file_driver=True))
+            if rc is None:
+                return None  # timed out
+
+            # -a file 非対応ビルドでは returncode != 0 になるのでドライバ省略でリトライ
+            if rc != 0:
+                self._log("  -a file ドライバ非対応、再試行中...", 84)
+                if ascii_wav.exists():
+                    ascii_wav.unlink()
+                rc, out, err = _run_fluidsynth(_build_cmd(use_file_driver=False))
+                if rc is None:
+                    return None
+
+            if rc != 0:
                 tail = (err or out or "no output").strip().splitlines()[-6:]
-                self._log(f"  FluidSynth エラー (rc={proc.returncode}):", -1)
+                self._log(f"  FluidSynth エラー (rc={rc}):", -1)
                 for line in tail:
                     self._log(f"    {line}", -1)
                 return None
@@ -1865,7 +1866,8 @@ class EarCopyEngine:
                 s0 = int(t * SR)
                 try:
                     tone = fn(midi, dur, vel)
-                except Exception:
+                except Exception as e:
+                    self._log(f"  ⚠ 音色生成スキップ [{name}] midi={midi}: {e}", -1)
                     continue
                 s1 = s0 + len(tone)
                 if s1 <= n:
@@ -2242,11 +2244,13 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_prog(self, msg, pct):
+        self.root.after(0, lambda m=msg, p=pct: self._on_prog_main(m, p))
+
+    def _on_prog_main(self, msg, pct):
         self._status.set(msg)
         if pct and pct > 0:
             self._progress.set(pct)
         self._append_log(msg)
-        self.root.update_idletasks()
 
     def _append_log(self, msg):
         self._log.configure(state="normal")
