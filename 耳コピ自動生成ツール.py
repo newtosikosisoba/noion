@@ -263,12 +263,15 @@ _ASSETS_DIR = Path(__file__).parent / "_assets"
 # 無料で商用可な汎用GM SoundFont（失敗時の候補を複数用意）
 _SF2_DOWNLOADS = [
     # (表示名, URL, 想定サイズMB, 拡張子)
-    ("TinySoundFont (GMGSx Lite)",
-     "https://github.com/schellingb/TinySoundFont/raw/master/tsf_test/tsf_test_gm.sf2", 8, "sf2"),
-    ("GeneralUser GS (Collins)",
-     "https://schristiancollins.com/soundfonts/GeneralUser_GS_v1.471.zip", 30, "zip"),
-    ("FluidR3_GM (Archive.org)",
-     "https://archive.org/download/fluidr3-gm-gs/FluidR3_GM.sf2", 140, "sf2"),
+    ("FluidR3_GM (SourceForge)",
+     "https://sourceforge.net/projects/pianobooster/files/pianobooster/1.0.0/FluidR3_GM.sf2/download",
+     140, "sf2"),
+    ("FluidR3_GM (GitHub)",
+     "https://github.com/urish/cinto/raw/master/media/FluidR3%20GM.sf2",
+     140, "sf2"),
+    ("FluidR3_GM (Musical Artifacts)",
+     "https://musical-artifacts.com/artifacts/738/FluidR3_GM.sf2",
+     140, "sf2"),
 ]
 
 
