@@ -67,32 +67,49 @@ def _importable(name):
 
 
 # AI系の重量級パッケージは process() 実行時に遅延インストール
-_AI_PACKAGES = [
-    # (import_name, pip_name, install_args)
+# 必須: torch + demucs（ステム分離の核心）
+_AI_PACKAGES_REQUIRED = [
     ("torch",        "torch",       ["torch", "--index-url", "https://download.pytorch.org/whl/cpu"]),
     ("demucs",       "demucs",      ["demucs"]),
+]
+# 任意: basic-pitch（Python 3.13+ 非対応の場合あり、pyin でフォールバック可）
+_AI_PACKAGES_OPTIONAL = [
     ("basic_pitch",  "basic-pitch", ["basic-pitch"]),
 ]
 
 
 def _ensure_ai_packages(log=print):
     """AIモード起動時に重量級パッケージを確保する（初回のみ大きなダウンロード）"""
-    missing = [(imp, pkg, args) for imp, pkg, args in _AI_PACKAGES
+    # 必須パッケージ
+    missing = [(imp, pkg, args) for imp, pkg, args in _AI_PACKAGES_REQUIRED
                if not _importable(imp)]
-    if not missing:
-        return True
-    log(f"AIモデル用パッケージを導入中 (初回のみ、約1-2GB): {', '.join(p for _, p, _ in missing)}")
-    for imp, pkg, args in missing:
-        log(f"  インストール中: {pkg} ...")
+    if missing:
+        log(f"AI必須パッケージを導入中 (初回のみ、約1-2GB): {', '.join(p for _, p, _ in missing)}")
+        for imp, pkg, args in missing:
+            log(f"  インストール中: {pkg} ...")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "-q"] + args,
+                    stderr=subprocess.STDOUT
+                )
+                log(f"  ✓ {pkg}")
+            except subprocess.CalledProcessError as e:
+                log(f"  ✗ {pkg} のインストールに失敗: {e}")
+                return False
+
+    # 任意パッケージ（失敗しても続行）
+    for imp, pkg, args in _AI_PACKAGES_OPTIONAL:
+        if _importable(imp):
+            continue
+        log(f"  オプション: {pkg} を導入中...")
         try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "-q"] + args,
-                stderr=subprocess.STDOUT
+                stderr=subprocess.DEVNULL
             )
             log(f"  ✓ {pkg}")
-        except subprocess.CalledProcessError as e:
-            log(f"  ✗ {pkg} のインストールに失敗: {e}")
-            return False
+        except subprocess.CalledProcessError:
+            log(f"  ⚠ {pkg} は利用不可（pyin で代替します）")
     return True
 
 
@@ -962,12 +979,37 @@ class EarCopyEngine:
         return out
 
     def _fallback_transcribe(self, audio, sr, is_vocal):
-        """Basic Pitch が使えない場合の pyin による単音採譜"""
+        """Basic Pitch が使えない場合: CQT多声部 + pyin を分離済みステムに適用
+
+        Demucsで分離された各ステム（ボーカルだけ/その他だけ）に対してCQTを
+        かけるため、v6.0の混合音全体解析よりも格段に精度が高い。
+        """
+        notes = []
+        # pyin で主旋律（単音）を検出
         fmin = librosa.note_to_hz("C3" if is_vocal else "C2")
         fmax = librosa.note_to_hz("C6" if is_vocal else "C7")
-        f0, voiced, _ = librosa.pyin(audio, fmin=fmin, fmax=fmax, sr=sr, hop_length=HOP)
-        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
-        return self._f0_to_notes(f0, voiced, times, 8)
+        try:
+            f0, voiced, _ = librosa.pyin(audio, fmin=fmin, fmax=fmax, sr=sr, hop_length=HOP)
+            times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
+            notes = self._f0_to_notes(f0, voiced, times, 8)
+        except Exception:
+            pass
+
+        # ボーカルでなければ CQT で多声部も追加検出
+        if not is_vocal:
+            try:
+                y_h, _ = librosa.effects.hpss(audio, margin=2.0)
+                cqt_notes = self._detect_all_notes(y_h, sr)
+                # pyin と重複しないノートだけ追加
+                pyin_set = {(round(t, 2), m) for t, _, m, _ in notes}
+                for (t, dur, midi, vel) in cqt_notes:
+                    key = (round(t, 2), midi)
+                    if key not in pyin_set:
+                        notes.append((t, dur, midi, vel))
+            except Exception:
+                pass
+
+        return notes
 
     # ---- pyin ベース採譜 (Demucs ベースステム用) ----------
 
