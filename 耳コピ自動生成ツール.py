@@ -73,8 +73,15 @@ _AI_PACKAGES_REQUIRED = [
     ("demucs",       "demucs",      ["demucs"]),
 ]
 # 任意: basic-pitch（Python 3.13+ 非対応の場合あり、pyin でフォールバック可）
+# 複数の導入方法を順に試行する（[onnx] が最も軽量、TF不要）
 _AI_PACKAGES_OPTIONAL = [
-    ("basic_pitch",  "basic-pitch", ["basic-pitch"]),
+    ("basic_pitch",  "basic-pitch", [
+        ["basic-pitch[onnx]"],                                       # 軽量: onnxruntime
+        ["basic-pitch[tflite]"],                                     # 軽量: TFLite
+        ["basic-pitch[coreml]"],                                     # macOS専用
+        ["basic-pitch"],                                             # フル: TensorFlow
+        ["basic-pitch", "--no-deps"],                                # 依存衝突回避
+    ]),
 ]
 
 
@@ -97,19 +104,39 @@ def _ensure_ai_packages(log=print):
                 log(f"  ✗ {pkg} のインストールに失敗: {e}")
                 return False
 
-    # 任意パッケージ（失敗しても続行）
-    for imp, pkg, args in _AI_PACKAGES_OPTIONAL:
+    # 任意パッケージ（失敗しても続行、複数の導入方法を順に試行）
+    for imp, pkg, install_variants in _AI_PACKAGES_OPTIONAL:
         if _importable(imp):
             continue
-        log(f"  オプション: {pkg} を導入中...")
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-q"] + args,
-                stderr=subprocess.DEVNULL
-            )
-            log(f"  ✓ {pkg}")
-        except subprocess.CalledProcessError:
-            log(f"  ⚠ {pkg} は利用不可（pyin で代替します）")
+        log(f"  オプション: {pkg} を導入中 ({len(install_variants)}方法を順に試行)...")
+        success = False
+        last_error = ""
+        for variant_idx, args in enumerate(install_variants, 1):
+            variant_name = " ".join(args)
+            log(f"    [{variant_idx}/{len(install_variants)}] pip install {variant_name}")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install"] + args,
+                    capture_output=True, text=True, timeout=300
+                )
+                if result.returncode == 0:
+                    log(f"  ✓ {pkg} ({variant_name})")
+                    success = True
+                    break
+                # stderr の末尾を最大 300 文字表示してエラー原因を見せる
+                err_tail = (result.stderr or result.stdout or "").strip().splitlines()
+                tail = "\n      ".join(err_tail[-4:]) if err_tail else "unknown"
+                last_error = tail
+                log(f"    ✗ 失敗:\n      {tail}")
+            except subprocess.TimeoutExpired:
+                last_error = "timeout (5min)"
+                log(f"    ✗ タイムアウト")
+            except Exception as e:
+                last_error = str(e)
+                log(f"    ✗ {e}")
+        if not success:
+            log(f"  ⚠ {pkg} は利用不可（pyin+CQTで代替します）")
+            log(f"    最終エラー: {last_error[:200]}")
     return True
 
 
