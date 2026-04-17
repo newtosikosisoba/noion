@@ -461,6 +461,103 @@ def _setup_fluidsynth():
 
 
 # =====================================================
+# FluidSynth CLI バイナリ自動セットアップ
+# =====================================================
+
+_FLUIDSYNTH_CONFIG = Path(__file__).parent / ".fluidsynth_path.json"
+_FLUIDSYNTH_DL = {
+    "Windows": (
+        "https://github.com/FluidSynth/fluidsynth/releases/download/v2.4.6/fluidsynth-2.4.6-win10-x64.zip",
+        "fluidsynth.exe"
+    ),
+}
+
+
+def _find_fluidsynth_cli():
+    """FluidSynth CLI バイナリを検出する"""
+    # 1. PATH にある場合
+    fs = shutil.which("fluidsynth")
+    if fs:
+        return fs
+
+    # 2. 前回保存パス
+    if _FLUIDSYNTH_CONFIG.exists():
+        try:
+            saved = json.loads(_FLUIDSYNTH_CONFIG.read_text())
+            p = saved.get("path", "")
+            if p and Path(p).exists():
+                return p
+        except Exception:
+            pass
+
+    # 3. _assets 内を検索
+    if _ASSETS_DIR.exists():
+        for p in _ASSETS_DIR.rglob("fluidsynth*"):
+            if p.is_file() and p.suffix in (".exe", ""):
+                _save_fluidsynth_path(str(p))
+                return str(p)
+
+    return None
+
+
+def _save_fluidsynth_path(path):
+    try:
+        _FLUIDSYNTH_CONFIG.write_text(json.dumps({"path": str(path)}))
+    except Exception:
+        pass
+
+
+def _download_fluidsynth(log=print):
+    """Windows 用 FluidSynth バイナリを GitHub からダウンロードする"""
+    system = platform.system()
+    if system not in _FLUIDSYNTH_DL:
+        log(f"  FluidSynth: {system} は自動DL非対応（手動インストールが必要）")
+        if system == "Darwin":
+            log("    → brew install fluidsynth")
+        else:
+            log("    → sudo apt install fluidsynth")
+        return None
+
+    url, exe_name = _FLUIDSYNTH_DL[system]
+    _ASSETS_DIR.mkdir(exist_ok=True)
+    log(f"  FluidSynth をダウンロード中 (~15MB)...")
+
+    import urllib.request
+    import zipfile
+    try:
+        dest_zip = _ASSETS_DIR / "fluidsynth.zip"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (EarCopyTool)"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+        if len(data) < 500_000:
+            raise RuntimeError(f"ダウンロードが小さすぎます ({len(data)} bytes)")
+        dest_zip.write_bytes(data)
+
+        # ZIP展開
+        with zipfile.ZipFile(dest_zip) as zf:
+            zf.extractall(_ASSETS_DIR)
+
+        # fluidsynth.exe を再帰検索
+        for p in _ASSETS_DIR.rglob(exe_name):
+            if p.is_file():
+                _save_fluidsynth_path(str(p))
+                log(f"  ✓ FluidSynth: {p}")
+                return str(p)
+        log("  ✗ ZIPにFluidSynthバイナリが見つかりません")
+    except Exception as e:
+        log(f"  ✗ FluidSynth DL失敗: {e}")
+    return None
+
+
+def _ensure_fluidsynth_cli(log=print):
+    """FluidSynth CLI が使える状態にする"""
+    fs = _find_fluidsynth_cli()
+    if fs:
+        return fs
+    return _download_fluidsynth(log)
+
+
+# =====================================================
 # 音楽分析エンジン
 # =====================================================
 
@@ -1157,43 +1254,55 @@ class EarCopyEngine:
     # ---- AI 検出結果 → 15楽器割り当て ----------------------
 
     def _ai_assign_parts(self, vocal_notes, other_notes, bass_notes):
-        """AI採譜結果を v6 互換の15パート形式に割り当てる"""
+        """プロアレンジ版: 楽器の重複を最小化し、役割を明確に分離する
+
+        Cubase での耳コピ作業を模倣:
+        - メロディは1楽器に集約（ピアノ）
+        - 伴奏コードは音域で1楽器ずつ担当（ギター or ストリングス）
+        - ベースは専用パート
+        - ダブリングは控えめに（原曲にない楽器は鳴らさない）
+        """
         parts = {name: [] for name in self.MIDI_MAP}
 
-        # ボーカル系は主旋律 → ピアノ(主) + フルート/バイオリン(エコー)
+        # === 1. メロディ (ボーカル採譜) → ピアノ主体 ===
+        # ダブリングは控えめ: 高音域だけフルートを薄く重ねる
         for (t, dur, midi, vel) in vocal_notes:
             parts['piano'].append((t, dur, midi, vel))
-            if midi >= 78:
-                parts['flute'].append((t, dur, midi, int(vel * 0.45)))
-            elif midi >= 64:
-                parts['violin'].append((t, dur, midi, int(vel * 0.5)))
-            else:
-                parts['choir'].append((t, dur, midi, int(vel * 0.3)))
 
-        # その他(伴奏) → 音域で楽器分け
-        for (t, dur, midi, vel) in other_notes:
+        # === 2. 伴奏 (other ステム) → 音域で楽器を分離 ===
+        # ポイント: 同時発音するノートは1つの楽器にまとめる
+        # 時間スライスで分類 → コード感を維持
+        other_sorted = sorted(other_notes, key=lambda x: x[0])
+
+        for (t, dur, midi, vel) in other_sorted:
             if midi >= 84:
-                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.5)))
+                # 超高音: グロッケン（控えめ）
+                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.45)))
             elif midi >= 72:
-                parts['e_piano'].append((t, dur, midi, int(vel * 0.6)))
-                if dur >= 0.35:
-                    parts['strings'].append((t, dur, midi, int(vel * 0.35)))
+                # 高音伴奏: エレピ（コード担当）
+                parts['e_piano'].append((t, dur, midi, int(vel * 0.65)))
             elif midi >= 60:
-                parts['guitar_clean'].append((t, dur, midi, int(vel * 0.7)))
-                if dur >= 0.4:
-                    parts['strings'].append((t, dur, midi, int(vel * 0.3)))
-            elif midi >= 48:
-                parts['guitar_nylon'].append((t, dur, midi, int(vel * 0.6)))
+                # 中音伴奏: ギター or ストリングス
                 if dur >= 0.5:
-                    parts['pad'].append((t, dur, midi, int(vel * 0.3)))
+                    parts['strings'].append((t, dur, midi, int(vel * 0.55)))
+                else:
+                    parts['guitar_clean'].append((t, dur, midi, int(vel * 0.6)))
+            elif midi >= 48:
+                # 低中音: ナイロンギター
+                parts['guitar_nylon'].append((t, dur, midi, int(vel * 0.55)))
             else:
-                parts['cello'].append((t, dur, midi, int(vel * 0.7)))
+                # 超低音: チェロ
+                parts['cello'].append((t, dur, midi, int(vel * 0.6)))
 
-        # ベース
+        # === 3. ベース → 専用パートのみ（ダブリングなし） ===
         for (t, dur, midi, vel) in bass_notes:
             parts['bass'].append((t, dur, midi, vel))
-            if midi + 12 < 55:
-                parts['cello'].append((t, dur, midi + 12, int(vel * 0.4)))
+
+        # === 4. ノート数が少ないパートに pad/choir を控えめ補充 ===
+        # (長い持続音が多い場合のみストリングスをパッドで補強)
+        long_strings = [(t, dur, m, v) for t, dur, m, v in parts['strings'] if dur >= 1.0]
+        for (t, dur, midi, vel) in long_strings:
+            parts['pad'].append((t, dur, midi, int(vel * 0.25)))
 
         return parts
 
@@ -1248,117 +1357,67 @@ class EarCopyEngine:
         return audio
 
     def _synthesize_fluidsynth(self, midi_path, duration):
-        """FluidSynth + SoundFont で MIDI を合成する"""
+        """FluidSynth CLI で MIDI → WAV → ndarray を実行する
+
+        pyfluidsynth (Python binding) はDLL問題が多いため、
+        FluidSynth CLI バイナリを直接呼び出す方式に変更。
+        Windows では自動ダウンロード対応。
+        """
+        # 1. SoundFont を確保
         sf2 = _find_sf2()
         if sf2 is None:
-            self._log("  SoundFont が見つからないため自動取得を試みます...", 82)
+            self._log("  SoundFont を自動取得中...", 82)
             sf2 = _download_sf2(lambda m: self._log(m, 83))
         if sf2 is None:
-            self._log("  自動取得失敗、手動選択ダイアログを表示します...", 84)
-            sf2 = _prompt_sf2_manually(lambda m: self._log(m, 84))
+            sf2 = _prompt_sf2_manually(lambda m: self._log(m, 83))
         if sf2 is None:
-            self._log("  SoundFontなし、v6加算合成を使用します", 84)
-            return None
-        if not _setup_fluidsynth():
-            self._log("  FluidSynthライブラリ未検出、v6加算合成を使用します", 84)
-            return None
-        try:
-            import fluidsynth
-        except Exception:
+            self._log("  SoundFont が見つかりません", 84)
             return None
 
+        # 2. FluidSynth CLI バイナリを確保
+        fs_bin = _ensure_fluidsynth_cli(lambda m: self._log(m, 84))
+        if fs_bin is None:
+            self._log("  FluidSynth CLI が見つかりません", 84)
+            return None
+
+        # 3. CLI で MIDI → WAV レンダリング
+        self._log("  FluidSynth でレンダリング中 (サンプル音源使用)...", 85)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_wav = f.name
         try:
-            fs = fluidsynth.Synth(samplerate=float(SR), gain=0.6)
-            sfid = fs.sfload(sf2)
-            if sfid == -1:
+            cmd = [
+                fs_bin, "-ni", sf2, midi_path,
+                "-F", tmp_wav,
+                "-r", str(SR),
+                "-g", "0.8",    # gain
+                "-R", "1",      # reverb on
+                "-C", "1",      # chorus on
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "unknown")[-300:]
+                self._log(f"  FluidSynth CLI エラー:\n    {err}", -1)
+                return None
+            if not Path(tmp_wav).exists() or Path(tmp_wav).stat().st_size < 1000:
+                self._log("  FluidSynth: WAV出力が空です", -1)
                 return None
 
-            # MIDI をパースして直接 fluidsynth に送る
-            mid = MidiFile(midi_path)
-
-            # 各チャンネルの program を pre-assign
-            for ch, prog in [(info[0], info[1]) for info in self.MIDI_MAP.values()]:
-                fs.program_select(ch, sfid, 0, prog)
-            # ドラム (ch9) は bank 128 (GM drum kit)
-            try:
-                fs.program_select(9, sfid, 128, 0)
-            except Exception:
-                pass
-
-            # リアルタイム代わりに非リアルタイム書き出し
-            # pyfluidsynth は get_samples(n) で合成できる
-            total_seconds = mid.length + 2.0
-            total_frames = int(total_seconds * SR)
-            buf = np.zeros(total_frames * 2, dtype=np.int16)  # ステレオ
-
-            # イベントをタイムスタンプ付きでソートして逐次送信＆合成
-            events = []  # (time_sec, msg)
-            cur_time = {i: 0.0 for i in range(len(mid.tracks))}
-            tempo_us = 500_000  # デフォルト 120BPM
-            tpb = mid.ticks_per_beat
-            # 全トラック統合
-            merged = []
-            for ti, tr in enumerate(mid.tracks):
-                abs_ticks = 0
-                for msg in tr:
-                    abs_ticks += msg.time
-                    merged.append((abs_ticks, msg))
-            merged.sort(key=lambda x: x[0])
-
-            def ticks_to_sec(ticks, tempo):
-                return ticks * (tempo / 1_000_000.0) / tpb
-
-            cur_ticks = 0
-            cur_sec = 0.0
-            cursor_frame = 0
-            for abs_ticks, msg in merged:
-                dt_ticks = abs_ticks - cur_ticks
-                dt_sec = ticks_to_sec(dt_ticks, tempo_us)
-                cur_ticks = abs_ticks
-                # dt_sec 分 fluidsynth から samples を取得
-                n_frames = int(dt_sec * SR)
-                if n_frames > 0:
-                    samples = fs.get_samples(n_frames)
-                    end = cursor_frame + n_frames * 2
-                    if end > len(buf):
-                        end = len(buf)
-                        samples = samples[: end - cursor_frame]
-                    buf[cursor_frame:end] = samples[: end - cursor_frame]
-                    cursor_frame = end
-                cur_sec += dt_sec
-                # msg を fluidsynth に送る
-                if msg.type == "set_tempo":
-                    tempo_us = msg.tempo
-                elif msg.type == "program_change":
-                    try:
-                        fs.program_change(msg.channel, msg.program)
-                    except Exception:
-                        pass
-                elif msg.type == "note_on":
-                    if msg.velocity > 0:
-                        fs.noteon(msg.channel, msg.note, msg.velocity)
-                    else:
-                        fs.noteoff(msg.channel, msg.note)
-                elif msg.type == "note_off":
-                    fs.noteoff(msg.channel, msg.note)
-                elif msg.type == "control_change":
-                    try:
-                        fs.cc(msg.channel, msg.control, msg.value)
-                    except Exception:
-                        pass
-            # 最後のリバーブ残響分
-            tail = fs.get_samples(int(1.5 * SR))
-            end = min(cursor_frame + len(tail), len(buf))
-            buf[cursor_frame:end] = tail[: end - cursor_frame]
-            fs.delete()
-
-            # ステレオを float モノに
-            stereo = buf.reshape(-1, 2).astype(np.float32) / 32768.0
-            mono = stereo.mean(axis=1)
-            return mono
+            audio, _ = librosa.load(tmp_wav, sr=SR, mono=True)
+            self._log(f"  ✓ FluidSynth レンダリング完了 ({len(audio)/SR:.1f}秒)", 88)
+            return audio
+        except subprocess.TimeoutExpired:
+            self._log("  FluidSynth: タイムアウト (5分)", -1)
+            return None
         except Exception as e:
             self._log(f"  FluidSynth 失敗: {e}", -1)
             return None
+        finally:
+            try:
+                os.unlink(tmp_wav)
+            except Exception:
+                pass
 
     # ---- ブレンド＆マスタリング ---------------------------
 
@@ -1830,25 +1889,74 @@ class EarCopyEngine:
         seg.export(path, format="mp3", bitrate="192k")
         os.unlink(tmp)
 
+    # ---- パート別 MIDI パン・ボリューム・エフェクト設定 -----
+
+    PART_MIX = {
+        #               pan(0=L,64=C,127=R)  vol  reverb  sustain
+        'piano':         (64,  105,  60,  True),
+        'e_piano':       (75,   85,  50,  False),
+        'glockenspiel':  (80,   65,  70,  False),
+        'organ':         (50,   72,  55,  False),
+        'guitar_nylon':  (40,   88,  45,  False),
+        'guitar_clean':  (90,   82,  40,  False),
+        'bass':          (64,  110,  25,  False),
+        'violin':        (45,   90,  65,  False),
+        'viola':         (55,   80,  60,  False),
+        'cello':         (58,   88,  55,  False),
+        'strings':       (64,   78,  70,  False),
+        'choir':         (64,   68,  75,  False),
+        'trumpet':       (85,   75,  50,  False),
+        'flute':         (35,   80,  60,  False),
+        'pad':           (64,   60,  80,  False),
+    }
+
     def _save_midi(self, parts, drums, tempo, path):
+        """プロ品質 MIDI 出力: pan/volume/reverb/sustain を各パートに設定"""
         mid = MidiFile(type=1, ticks_per_beat=480)
         tpb = 480
         us = int(60_000_000 / tempo)
         def s2t(s): return int(s * tempo / 60 * tpb)
+
+        # テンポトラック
         tt = MidiTrack()
         tt.append(MetaMessage('set_tempo', tempo=us, time=0))
         mid.tracks.append(tt)
+
         for name, evts in parts.items():
             if not evts:
                 continue
             ch, prog = self.MIDI_MAP[name]
-            evs = [(0, Message('program_change', channel=ch, program=prog, time=0))]
-            for (t, dur, midi, vel) in evts:
-                note = int(np.clip(midi, 0, 127))
+            pan, vol, reverb_amt, use_sustain = self.PART_MIX.get(
+                name, (64, 85, 50, False))
+
+            evs = []
+            # Program Change + 初期CC設定
+            evs.append((0, Message('program_change', channel=ch, program=prog, time=0)))
+            evs.append((0, Message('control_change', channel=ch, control=7, value=vol, time=0)))   # CC7 Volume
+            evs.append((0, Message('control_change', channel=ch, control=10, value=pan, time=0)))  # CC10 Pan
+            evs.append((0, Message('control_change', channel=ch, control=91, value=reverb_amt, time=0)))  # CC91 Reverb
+            evs.append((0, Message('control_change', channel=ch, control=93, value=35, time=0)))   # CC93 Chorus
+
+            # サスティンペダル（ピアノ系のみ: 各ビートの頭で踏み替え）
+            if use_sustain and len(evts) > 0:
+                max_t = max(t for t, _, _, _ in evts)
+                pedal_interval = 60.0 / max(tempo, 60) * 2  # 2ビートごとに踏み替え
+                t_cur = 0.0
+                while t_cur < max_t:
+                    tick = s2t(t_cur)
+                    evs.append((tick, Message('control_change', channel=ch, control=64, value=0, time=0)))
+                    evs.append((tick + 5, Message('control_change', channel=ch, control=64, value=127, time=0)))
+                    t_cur += pedal_interval
+
+            # ノートイベント
+            for (t, dur, midi_note, vel) in evts:
+                note = int(np.clip(midi_note, 0, 127))
                 v = min(max(vel, 1), 127)
                 t0, t1 = s2t(t), s2t(t + dur)
                 evs.append((t0, Message('note_on', channel=ch, note=note, velocity=v, time=0)))
                 evs.append((t1, Message('note_off', channel=ch, note=note, velocity=0, time=0)))
+
+            # ソート＆delta time 変換
             trk = MidiTrack()
             evs.sort(key=lambda x: x[0])
             prev = 0
@@ -1857,13 +1965,21 @@ class EarCopyEngine:
                 trk.append(msg)
                 prev = tick
             mid.tracks.append(trk)
+
+        # ドラムトラック (ch9)
         DM = {'kick': 36, 'snare': 38, 'hihat': 42, 'ride': 51}
         devs = []
+        # ドラム初期設定
+        devs.append((0, Message('control_change', channel=9, control=7, value=105, time=0)))  # Vol
+        devs.append((0, Message('control_change', channel=9, control=10, value=64, time=0)))  # Pan center
+        devs.append((0, Message('control_change', channel=9, control=91, value=30, time=0)))  # Reverb
         for (t, kind) in drums:
             n = DM.get(kind, 38)
+            # ドラムのベロシティも種類で変える
+            dv = {'kick': 105, 'snare': 100, 'hihat': 75, 'ride': 70}.get(kind, 90)
             t0 = s2t(t)
-            devs.append((t0, Message('note_on', channel=9, note=n, velocity=95, time=0)))
-            devs.append((t0+30, Message('note_off', channel=9, note=n, velocity=0, time=0)))
+            devs.append((t0, Message('note_on', channel=9, note=n, velocity=dv, time=0)))
+            devs.append((t0 + 30, Message('note_off', channel=9, note=n, velocity=0, time=0)))
         if devs:
             dtrk = MidiTrack()
             devs.sort(key=lambda x: x[0])
