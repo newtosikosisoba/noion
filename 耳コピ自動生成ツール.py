@@ -888,7 +888,13 @@ class EarCopyEngine:
         drum_events = self._drums_from_stem(stems["drums"], sr)
         self._log(f"  ドラム: {len(drum_events)} イベント", 74)
 
-        # 4. AI検出結果を15楽器パートに割り当て
+        # 4. ノート精度向上: ビート量子化 + ベロシティ正規化
+        self._log("ノート量子化・正規化中...", 76)
+        vocal_notes = self._quantize_notes(vocal_notes, beats, tempo)
+        other_notes = self._quantize_notes(other_notes, beats, tempo)
+        bass_notes = self._quantize_notes(bass_notes, beats, tempo)
+
+        # 5. AI検出結果を15楽器パートに割り当て
         parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
 
         # 5. MIDI 保存
@@ -1191,6 +1197,43 @@ class EarCopyEngine:
 
         return parts
 
+    # ---- ノート量子化・正規化 ----------------------------
+
+    def _quantize_notes(self, notes, beat_times, tempo):
+        """ノートをビートグリッドにスナップし、重複ノートを統合する"""
+        if not notes or beat_times is None or len(beat_times) < 2:
+            return notes
+
+        # 16分音符グリッドを生成
+        beat_dur = 60.0 / max(tempo, 60)
+        grid_step = beat_dur / 4  # 16分
+        max_t = beat_times[-1] + beat_dur * 4
+        grid = np.arange(0, max_t, grid_step)
+
+        quantized = []
+        for (t, dur, midi, vel) in notes:
+            # 最寄りのグリッドにスナップ（最大 grid_step/2 まで）
+            idx = np.argmin(np.abs(grid - t))
+            qt = grid[idx]
+            if abs(qt - t) > grid_step * 0.6:
+                qt = t  # 遠すぎるならスナップしない
+            # durationも最寄りのグリッド倍数に丸め
+            qdur = max(round(dur / grid_step) * grid_step, grid_step)
+            qdur = min(qdur, dur * 1.5)
+            quantized.append((qt, qdur, midi, vel))
+
+        # 同一時刻・同一ピッチの重複除去（loudest 優先）
+        seen = {}
+        for (t, dur, midi, vel) in quantized:
+            key = (round(t, 3), midi)
+            if key in seen:
+                ot, od, om, ov = seen[key]
+                if vel > ov:
+                    seen[key] = (t, dur, midi, vel)
+            else:
+                seen[key] = (t, dur, midi, vel)
+        return sorted(seen.values(), key=lambda x: x[0])
+
     # ---- 合成 (FluidSynth 優先) ---------------------------
 
     def _synthesize_audio(self, midi_path, parts, drum_events, duration):
@@ -1333,18 +1376,35 @@ class EarCopyEngine:
         return (1 - ratio) * a + ratio * b
 
     def _master(self, audio):
-        """簡易マスタリング: ソフトクリップ + ハイパスで低域ノイズ除去"""
+        """マスタリング: HP/LP EQ → コンプレッサー → ソフトクリップ"""
         if len(audio) == 0:
             return audio.astype(np.float32)
-        # ハイパス 30Hz
         nyq = SR / 2
-        b, a = butter(2, 30 / nyq, btype="high")
+
+        # ハイパス 35Hz (超低域ノイズ除去)
+        b, a = butter(3, 35 / nyq, btype="high")
         audio = filtfilt(b, a, audio).astype(np.float32)
+
+        # ローパス 16kHz (耳障りな超高域を抑制)
+        b, a = butter(2, min(16000 / nyq, 0.99), btype="low")
+        audio = filtfilt(b, a, audio).astype(np.float32)
+
+        # 簡易コンプレッサー（ブロック単位 RMS ベース）
+        block = int(SR * 0.02)  # 20ms ブロック
+        threshold = 0.3
+        ratio = 3.0
+        for i in range(0, len(audio) - block, block):
+            chunk = audio[i:i + block]
+            rms = np.sqrt(np.mean(chunk ** 2) + 1e-9)
+            if rms > threshold:
+                gain = threshold + (rms - threshold) / ratio
+                audio[i:i + block] *= gain / rms
+
         # ノーマライズ + ソフトクリップ
         peak = np.max(np.abs(audio))
         if peak > 0:
             audio = audio / peak * 0.95
-        audio = np.tanh(audio * 1.1) * 0.92
+        audio = np.tanh(audio * 1.05) * 0.93
         return audio.astype(np.float32)
 
     # ---- 音声読み込み ------------------------------------
@@ -1405,7 +1465,7 @@ class EarCopyEngine:
             events.append((ot, kind))
         return events
 
-    # ---- 7楽器シンセサイザー --------------------------------
+    # ---- v7.0 物理モデリングシンセサイザー ====================
 
     def _t(self, dur):
         return np.arange(max(1, int(dur * SR))) / SR
@@ -1426,102 +1486,259 @@ class EarCopyEngine:
             e[n-ri:] *= np.linspace(1, 0, ri)
         return e
 
-    # ---- 15楽器シンセサイザー --------------------------------
+    # ---- 合成ユーティリティ --------------------------------
+
+    def _karplus_strong(self, freq, duration, decay=0.996, brightness=0.5):
+        """Karplus-Strong 物理弦モデル（lfilter による高速実装）"""
+        from scipy.signal import lfilter as _lf
+        N = max(2, int(SR / freq))
+        n_samples = max(1, int(duration * SR))
+        excitation = np.zeros(n_samples)
+        noise = np.random.uniform(-1, 1, N)
+        filt_w = max(0.1, 1.0 - brightness)
+        noise = np.convolve(noise, [filt_w / 2, 1 - filt_w, filt_w / 2], mode='same')
+        excitation[:N] = noise
+        a = np.zeros(N + 2)
+        a[0] = 1.0
+        a[N] = -decay * 0.5
+        a[N + 1] = -decay * 0.5
+        return _lf(np.array([1.0]), a, excitation)
+
+    def _fm_synth(self, freq, duration, mod_ratio=2.0, mod_index=3.0, decay=2.0):
+        """FM合成: mod_index が音色の豊かさを決定"""
+        t = self._t(duration)
+        mod = mod_index * np.sin(2 * np.pi * freq * mod_ratio * t)
+        mod *= np.exp(-t * decay)
+        return np.sin(2 * np.pi * freq * t + mod)
+
+    def _bowed_string(self, freq, duration, vibrato_rate=5.5, vibrato_depth=0.004):
+        """弓弦シミュレーション: 鉤型波+フォルマント+遅延ビブラート"""
+        t = self._t(duration)
+        vib_onset = np.clip(t - 0.15, 0, None) * 3
+        vib_onset = np.minimum(vib_onset, 1.0)
+        vib = 1 + vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t) * vib_onset
+        phase = 2 * np.pi * freq * vib * t
+        saw = 2 * (phase / (2 * np.pi) - np.floor(phase / (2 * np.pi) + 0.5))
+        # 2次 LP で粗いエッジを丸める (lfilter)
+        from scipy.signal import lfilter as _lf
+        cutoff = min(freq * 6, SR * 0.45)
+        rc = 1 / (2 * np.pi * cutoff)
+        dt = 1 / SR
+        alpha = dt / (rc + dt)
+        b = np.array([alpha * alpha])
+        a = np.array([1.0, -2 * (1 - alpha), (1 - alpha) ** 2])
+        return _lf(b, a, saw)
+
+    def _reverb_signal(self, signal, room_size=0.65, wet=0.18):
+        """Schroeder リバーブ (4comb + 2allpass, lfilter 高速実装)"""
+        from scipy.signal import lfilter as _lf
+        comb_params = [
+            (int(0.0297 * SR), room_size * 0.93),
+            (int(0.0371 * SR), room_size * 0.91),
+            (int(0.0411 * SR), room_size * 0.88),
+            (int(0.0437 * SR), room_size * 0.86),
+        ]
+        tail = int(SR * 0.4)
+        padded = np.zeros(len(signal) + tail)
+        padded[:len(signal)] = signal
+
+        reverbed = np.zeros(len(padded))
+        for delay, gain in comb_params:
+            a = np.zeros(delay + 1)
+            a[0] = 1.0
+            a[delay] = -gain
+            reverbed += _lf(np.array([1.0]), a, padded)
+        reverbed /= len(comb_params)
+
+        allpass_params = [(int(0.005 * SR), 0.5), (int(0.0017 * SR), 0.5)]
+        for delay, gain in allpass_params:
+            b = np.zeros(delay + 1)
+            b[0] = -gain
+            b[delay] = 1.0
+            a = np.zeros(delay + 1)
+            a[0] = 1.0
+            a[delay] = -gain
+            reverbed = _lf(b, a, reverbed)
+
+        n = len(signal)
+        return ((1 - wet) * signal + wet * reverbed[:n]).astype(np.float32)
+
+    # ---- 15楽器 物理モデリング音色 ==========================
 
     def _tone_piano(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        sig = sum((0.75**h)*np.sin(2*np.pi*hz*(h+1)*t) for h in range(8) if hz*(h+1)<SR/2)
-        return sig * np.exp(-t*(1.5+hz/600)) * self._env(t,0.003,0.08,0.5,0.12) * (vel/127)*0.25
+        hz = 440 * SEMI ** (midi - 69)
+        # Karplus-Strong に明るいアタック + デチューンした複弦
+        decay = 0.997 - hz / 80000
+        s1 = self._karplus_strong(hz, dur, decay, brightness=0.7)
+        s2 = self._karplus_strong(hz * 1.001, dur, decay, brightness=0.6)
+        s3 = self._karplus_strong(hz * 0.999, dur, decay, brightness=0.6)
+        sig = s1 * 0.5 + s2 * 0.25 + s3 * 0.25
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        return sig * self._env(t, 0.002, 0.06, 0.55, 0.1) * (vel / 127) * 0.30
 
     def _tone_e_piano(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        mod = np.sin(2*np.pi*hz*t) * (vel/127) * 3
-        sig = np.sin(2*np.pi*hz*t + mod) + 0.3*np.sin(2*np.pi*hz*2*t)*np.exp(-t*4)
-        return sig * np.exp(-t*2) * self._env(t,0.002,0.1,0.4,0.15) * (vel/127)*0.22
+        hz = 440 * SEMI ** (midi - 69)
+        # FM合成: DX7風のベルっぽいエレピ
+        sig = self._fm_synth(hz, dur, mod_ratio=14.0, mod_index=vel / 127 * 4.0, decay=3.5)
+        sig += self._fm_synth(hz, dur, mod_ratio=1.0, mod_index=2.0, decay=2.0) * 0.4
+        t = self._t(dur)
+        return sig * np.exp(-t * 2.2) * self._env(t, 0.001, 0.08, 0.4, 0.12) * (vel / 127) * 0.22
 
     def _tone_glockenspiel(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(max(dur, 0.8))
-        sig = (np.sin(2*np.pi*hz*t) + 0.6*np.sin(2*np.pi*hz*2.76*t)
-               + 0.3*np.sin(2*np.pi*hz*5.4*t) + 0.1*np.sin(2*np.pi*hz*8.93*t))
-        return sig * np.exp(-t*3) * self._env(t,0.001,0.02,0.3,0.2) * (vel/127)*0.15
+        hz = 440 * SEMI ** (midi - 69)
+        t = self._t(max(dur, 1.0))
+        # 非整数倍音で金属質
+        sig = (np.sin(2 * np.pi * hz * t)
+               + 0.5 * np.sin(2 * np.pi * hz * 2.76 * t)
+               + 0.3 * np.sin(2 * np.pi * hz * 5.4 * t)
+               + 0.15 * np.sin(2 * np.pi * hz * 8.93 * t))
+        return sig * np.exp(-t * 2.5) * self._env(t, 0.0005, 0.01, 0.25, 0.3) * (vel / 127) * 0.14
 
     def _tone_organ(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        sig = (0.8*np.sin(2*np.pi*hz*0.5*t) + np.sin(2*np.pi*hz*t)
-               + 0.6*np.sin(2*np.pi*hz*1.5*t) + 0.8*np.sin(2*np.pi*hz*2*t)
-               + 0.3*np.sin(2*np.pi*hz*3*t) + 0.5*np.sin(2*np.pi*hz*4*t))
-        return sig/4 * self._env(t,0.01,0.02,0.9,0.05) * (vel/127)*0.18
+        hz = 440 * SEMI ** (midi - 69)
+        t = self._t(dur)
+        # ハモンドオルガン風: ドローバー合成
+        drawbars = [0.8, 1.0, 0.6, 0.8, 0.3, 0.5, 0.2, 0.1, 0.05]
+        ratios = [0.5, 1, 1.5, 2, 3, 4, 5, 6, 8]
+        sig = sum(d * np.sin(2 * np.pi * hz * r * t) for d, r in zip(drawbars, ratios) if hz * r < SR / 2)
+        # ロータリースピーカー風トレモロ
+        trem = 1 + 0.15 * np.sin(2 * np.pi * 6.5 * t)
+        return sig / 4 * trem * self._env(t, 0.008, 0.02, 0.88, 0.04) * (vel / 127) * 0.16
 
     def _tone_guitar_nylon(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        sig = sum((0.7**h)*np.sin(2*np.pi*hz*(h+1)*t) for h in range(6) if hz*(h+1)<SR/2)
-        return sig * np.exp(-t*2.5) * self._env(t,0.002,0.06,0.4,0.08) * (vel/127)*0.20
+        hz = 440 * SEMI ** (midi - 69)
+        sig = self._karplus_strong(hz, dur, decay=0.994, brightness=0.3)
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        # ボディ共鳴: 低域ブースト
+        from scipy.signal import lfilter as _lf
+        b_r, a_r = butter(2, min(2500 / (SR / 2), 0.99), btype='low')
+        sig = _lf(b_r, a_r, sig)
+        return sig * self._env(t, 0.002, 0.04, 0.35, 0.06) * (vel / 127) * 0.22
 
     def _tone_guitar_clean(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        sig = sum((0.65**h)*np.sin(2*np.pi*hz*(h+1)*t+h*0.2) for h in range(8) if hz*(h+1)<SR/2)
-        return sig * np.exp(-t*2.0) * self._env(t,0.001,0.04,0.45,0.1) * (vel/127)*0.18
+        hz = 440 * SEMI ** (midi - 69)
+        sig = self._karplus_strong(hz, dur, decay=0.995, brightness=0.6)
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        return sig * self._env(t, 0.001, 0.03, 0.4, 0.08) * (vel / 127) * 0.20
 
     def _tone_bass(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        sig = np.sin(2*np.pi*hz*t) + 0.5*np.sin(2*np.pi*hz*2*t) + 0.2*np.sin(2*np.pi*hz*3*t)
-        return sig * np.exp(-t*1.4) * self._env(t,0.008,0.05,0.75,0.1) * (vel/127)*0.35
+        hz = 440 * SEMI ** (midi - 69)
+        # KS + サブ基音
+        sig = self._karplus_strong(hz, dur, decay=0.993, brightness=0.25)
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        sub = np.sin(2 * np.pi * hz * t) * np.exp(-t * 1.2)
+        sig = sig * 0.6 + sub * 0.4
+        return sig * self._env(t, 0.005, 0.04, 0.7, 0.08) * (vel / 127) * 0.38
 
     def _tone_violin(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.004*np.sin(2*np.pi*5.8*t)
-        sig = sum(((-1)**h*0.7**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(6) if hz*(h+1)<SR/2)
-        return sig * self._env(t,0.05,0.08,0.85,0.12) * (vel/127)*0.20
+        hz = 440 * SEMI ** (midi - 69)
+        sig = self._bowed_string(hz, dur, vibrato_rate=5.8, vibrato_depth=0.005)
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        return sig * self._env(t, 0.04, 0.06, 0.85, 0.1) * (vel / 127) * 0.22
 
     def _tone_viola(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.003*np.sin(2*np.pi*5.2*t)
-        sig = sum(((-1)**h*0.75**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(5) if hz*(h+1)<SR/2)
-        return sig * self._env(t,0.06,0.1,0.8,0.15) * (vel/127)*0.18
+        hz = 440 * SEMI ** (midi - 69)
+        sig = self._bowed_string(hz, dur, vibrato_rate=5.2, vibrato_depth=0.004)
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        return sig * self._env(t, 0.05, 0.08, 0.8, 0.12) * (vel / 127) * 0.20
 
     def _tone_cello(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.003*np.sin(2*np.pi*4.5*t)
-        sig = sum((0.8**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(7) if hz*(h+1)<SR/2)
-        return sig * self._env(t,0.04,0.1,0.8,0.15) * (vel/127)*0.22
+        hz = 440 * SEMI ** (midi - 69)
+        sig = self._bowed_string(hz, dur, vibrato_rate=4.5, vibrato_depth=0.004)
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        return sig * self._env(t, 0.03, 0.08, 0.82, 0.12) * (vel / 127) * 0.24
 
     def _tone_strings(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.003*np.sin(2*np.pi*5*t)
-        s1 = sum((0.7**h)*np.sin(2*np.pi*hz*(h+1)*vib*t) for h in range(5) if hz*(h+1)<SR/2)
-        s2 = sum((0.7**h)*np.sin(2*np.pi*hz*1.002*(h+1)*vib*t) for h in range(5) if hz*1.002*(h+1)<SR/2)
-        s3 = sum((0.7**h)*np.sin(2*np.pi*hz*0.998*(h+1)*vib*t) for h in range(5) if hz*0.998*(h+1)<SR/2)
-        return (s1+s2+s3)/3 * self._env(t,0.12,0.15,0.7,0.2) * (vel/127)*0.15
+        hz = 440 * SEMI ** (midi - 69)
+        # 3本のデチューン弓弦でアンサンブル
+        s1 = self._bowed_string(hz, dur, 5.0, 0.003)
+        s2 = self._bowed_string(hz * 1.002, dur, 5.3, 0.003)
+        s3 = self._bowed_string(hz * 0.998, dur, 4.7, 0.003)
+        sig = (s1 + s2 + s3) / 3
+        t = self._t(dur)
+        if len(sig) > len(t):
+            sig = sig[:len(t)]
+        elif len(sig) < len(t):
+            sig = np.pad(sig, (0, len(t) - len(sig)))
+        return sig * self._env(t, 0.1, 0.12, 0.7, 0.18) * (vel / 127) * 0.16
 
     def _tone_choir(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.005*np.sin(2*np.pi*5.5*t)
-        sig = (np.sin(2*np.pi*hz*vib*t) + 0.5*np.sin(2*np.pi*hz*2*vib*t)
-               + 0.3*np.sin(2*np.pi*hz*3*vib*t) + 0.4*np.sin(2*np.pi*hz*1.003*vib*t)
-               + 0.4*np.sin(2*np.pi*hz*0.997*vib*t))
-        return sig/3 * self._env(t,0.2,0.15,0.65,0.25) * (vel/127)*0.12
+        hz = 440 * SEMI ** (midi - 69)
+        t = self._t(dur)
+        vib = 1 + 0.005 * np.sin(2 * np.pi * 5.5 * t)
+        # フォルマント3バンドでアー母音
+        formants = [(800, 80), (1200, 90), (2500, 120)]
+        sig = np.zeros(len(t))
+        for ff, bw in formants:
+            carrier = np.sin(2 * np.pi * hz * vib * t)
+            env_f = np.exp(-0.5 * ((hz - ff) / bw) ** 2) + 0.1
+            sig += carrier * env_f
+        # デチューン
+        sig += 0.3 * np.sin(2 * np.pi * hz * 1.003 * vib * t)
+        sig += 0.3 * np.sin(2 * np.pi * hz * 0.997 * vib * t)
+        return sig / 3 * self._env(t, 0.18, 0.12, 0.6, 0.22) * (vel / 127) * 0.13
 
     def _tone_trumpet(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.002*np.sin(2*np.pi*5.5*t)
-        sig = (np.sin(2*np.pi*hz*vib*t) + 0.8*np.sin(2*np.pi*hz*2*vib*t)
-               + 0.6*np.sin(2*np.pi*hz*3*vib*t) + 0.5*np.sin(2*np.pi*hz*4*vib*t)
-               + 0.3*np.sin(2*np.pi*hz*5*vib*t))
-        return sig/3 * self._env(t,0.03,0.06,0.85,0.08) * (vel/127)*0.20
+        hz = 440 * SEMI ** (midi - 69)
+        t = self._t(dur)
+        vib = 1 + 0.002 * np.sin(2 * np.pi * 5.5 * t) * np.clip(t - 0.1, 0, 1)
+        # 矩形波に近い奇数倍音構成
+        sig = np.zeros(len(t))
+        for h in range(1, 12, 2):
+            if hz * h >= SR / 2:
+                break
+            sig += (1.0 / h) * np.sin(2 * np.pi * hz * h * vib * t)
+        sig += 0.2 * np.random.randn(len(t)) * np.exp(-t * 15)  # ブレスノイズ
+        return sig * self._env(t, 0.025, 0.05, 0.85, 0.06) * (vel / 127) * 0.20
 
     def _tone_flute(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        vib = 1 + 0.003*np.sin(2*np.pi*5.5*t)
-        sig = np.sin(2*np.pi*hz*vib*t) + 0.1*np.sin(2*np.pi*hz*2*vib*t)
-        sig += np.random.randn(len(t)) * 0.02 * np.exp(-t*3)
-        return sig * self._env(t,0.06,0.1,0.8,0.15) * (vel/127)*0.18
+        hz = 440 * SEMI ** (midi - 69)
+        t = self._t(dur)
+        vib = 1 + 0.003 * np.sin(2 * np.pi * 5.5 * t) * np.clip(t - 0.2, 0, 1)
+        sig = np.sin(2 * np.pi * hz * vib * t) + 0.08 * np.sin(2 * np.pi * hz * 2 * vib * t)
+        # ブレスノイズ
+        breath = np.random.randn(len(t)) * 0.05
+        breath *= self._env(t, 0.08, 0.1, 0.03, 0.05)
+        sig += breath
+        return sig * self._env(t, 0.05, 0.08, 0.8, 0.12) * (vel / 127) * 0.18
 
     def _tone_pad(self, midi, dur, vel):
-        hz = 440 * SEMI ** (midi - 69); t = self._t(dur)
-        s1 = np.sin(2*np.pi*hz*t)
-        s2 = np.sin(2*np.pi*hz*1.003*t)
-        s3 = np.sin(2*np.pi*hz*0.997*t)
-        return (s1+s2+s3)/3 * self._env(t,0.15,0.2,0.6,0.3) * (vel/127)*0.12
+        hz = 440 * SEMI ** (midi - 69)
+        t = self._t(dur)
+        # ゆっくり揺れるデチューン和音
+        s1 = np.sin(2 * np.pi * hz * t)
+        s2 = np.sin(2 * np.pi * hz * 1.004 * t)
+        s3 = np.sin(2 * np.pi * hz * 0.996 * t)
+        lfo = 1 + 0.1 * np.sin(2 * np.pi * 0.3 * t)
+        return (s1 + s2 + s3) / 3 * lfo * self._env(t, 0.2, 0.25, 0.6, 0.35) * (vel / 127) * 0.13
 
     TONE_FN = {
         'piano':'_tone_piano', 'e_piano':'_tone_e_piano',
@@ -1539,13 +1756,18 @@ class EarCopyEngine:
             g = self.GAIN.get(name, 0.5)
             for (t, dur, midi, vel) in evts:
                 s0 = int(t * SR)
-                tone = fn(midi, dur, vel)
+                try:
+                    tone = fn(midi, dur, vel)
+                except Exception:
+                    continue
                 s1 = s0 + len(tone)
                 if s1 <= n:
                     buf[s0:s1] += tone * g
+        # 全楽器合成後にリバーブ適用
+        buf = self._reverb_signal(buf, room_size=0.55, wet=0.14)
         return buf
 
-    # ---- ドラム合成（4種） ---------------------------------
+    # ---- ドラム合成（改良版・6種） ---------------------------
 
     def _synth_drums(self, events, n):
         buf = np.zeros(n)
@@ -1555,28 +1777,43 @@ class EarCopyEngine:
             s1 = s0 + len(snd)
             if s1 <= n:
                 buf[s0:s1] += snd
+        # ドラムには控えめなルームリバーブ
+        buf = self._reverb_signal(buf, room_size=0.35, wet=0.08)
         return buf
 
     def _drum_sound(self, kind):
         if kind == 'kick':
-            t = self._t(0.3)
-            sweep = 70 * np.exp(-t * 25)
-            return (np.sin(2*np.pi*np.cumsum(sweep)/SR) * np.exp(-t*10)
-                    + 0.2*np.random.randn(len(t))*np.exp(-t*30)) * 0.7
+            t = self._t(0.35)
+            sweep = 80 * np.exp(-t * 20) + 45
+            sig = np.sin(2 * np.pi * np.cumsum(sweep) / SR) * np.exp(-t * 8)
+            sub = np.sin(2 * np.pi * 50 * t) * np.exp(-t * 12)
+            click = np.random.randn(len(t)) * np.exp(-t * 60) * 0.15
+            return (sig * 0.7 + sub * 0.25 + click) * 0.75
         elif kind == 'snare':
-            t = self._t(0.15)
-            return (0.4*np.sin(2*np.pi*200*t)*np.exp(-t*25)
-                    + 0.7*np.random.randn(len(t))*np.exp(-t*20)) * 0.55
+            t = self._t(0.2)
+            body = np.sin(2 * np.pi * 185 * t) * np.exp(-t * 20)
+            body += np.sin(2 * np.pi * 330 * t) * np.exp(-t * 25) * 0.4
+            noise = np.random.randn(len(t)) * np.exp(-t * 16)
+            b, a = butter(2, [min(1500 / (SR / 2), 0.99), min(8000 / (SR / 2), 0.99)], btype='band')
+            noise = filtfilt(b, a, noise)
+            return (body * 0.45 + noise * 0.55) * 0.6
         elif kind == 'ride':
-            t = self._t(0.3)
+            t = self._t(0.5)
             n_ = np.random.randn(len(t))
-            b, a = butter(4, min(4000/(SR/2), 0.99), btype='high')
-            return filtfilt(b, a, n_) * np.exp(-t*8) * 0.25
-        else:  # hihat
-            t = self._t(0.04)
+            b, a = butter(3, min(3500 / (SR / 2), 0.99), btype='high')
+            sig = filtfilt(b, a, n_) * np.exp(-t * 5)
+            bell = np.sin(2 * np.pi * 2800 * t) * np.exp(-t * 8) * 0.15
+            return (sig + bell) * 0.22
+        elif kind == 'hihat':
+            t = self._t(0.06)
             n_ = np.random.randn(len(t))
-            b, a = butter(4, min(6500/(SR/2), 0.99), btype='high')
-            return filtfilt(b, a, n_) * np.exp(-t*100) * 0.4
+            b, a = butter(3, min(6000 / (SR / 2), 0.99), btype='high')
+            return filtfilt(b, a, n_) * np.exp(-t * 70) * 0.35
+        else:
+            t = self._t(0.12)
+            n_ = np.random.randn(len(t))
+            b, a = butter(3, min(5000 / (SR / 2), 0.99), btype='high')
+            return filtfilt(b, a, n_) * np.exp(-t * 30) * 0.3
 
     # ---- ファイル保存 ------------------------------------
 
