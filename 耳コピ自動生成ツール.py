@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-耳コピ自動生成ツール v6.0
-MP3をドラッグ&ドロップするだけで耳コピ音源（MIDI再合成）を自動作成
-16楽器フルアレンジ + 高精度CQT/pyin複合検出
+耳コピ自動生成ツール v7.0
+MP3をドラッグ&ドロップするだけで原曲忠実な耳コピ音源を自動作成
+
+v7.0 の革新:
+  - Demucs (Meta): ボーカル/ドラム/ベース/その他の AI ステム分離
+  - Basic Pitch (Spotify): SOTA 多声部ポリフォニック MIDI 採譜
+  - FluidSynth + SoundFont: 本物のサンプル音源による再合成
+  - 原曲ブレンド: 原曲ステムと合成MIDIを任意比率でミックス
+  - v6.0 の加算合成はフォールバックとして残存
 
 必要環境: Python 3.8+
-初回起動時に依存パッケージを自動インストールします
+初回起動時に依存パッケージを自動インストールします（AIモード時は約1-2GB）
 
 使い方:
   GUI:  python 耳コピ自動生成ツール.py
-  CLI:  python 耳コピ自動生成ツール.py input.mp3 [-o output.mp3]
+  CLI:  python 耳コピ自動生成ツール.py input.mp3 [-o output.mp3] [--mode MODE]
+        MODE: ai (Demucs+BasicPitch / デフォルト) | classic (v6.0相当) | karaoke (伴奏のみ)
 """
 
 import os
@@ -23,6 +30,7 @@ import platform
 # =====================================================
 
 def _ensure_packages():
+    """起動時に必要な軽量パッケージを確保する（AI系は遅延インストール）"""
     PACKAGES = [
         ("numpy",       "numpy"),
         ("librosa",     "librosa"),
@@ -36,7 +44,6 @@ def _ensure_packages():
                if not _importable(imp)]
     if missing:
         print(f"[初回セットアップ] パッケージをインストールします: {', '.join(missing)}")
-        failed = []
         for pkg in missing:
             try:
                 subprocess.check_call(
@@ -46,9 +53,7 @@ def _ensure_packages():
                 print(f"  ✓ {pkg}")
             except subprocess.CalledProcessError:
                 print(f"  ✗ {pkg} のインストールに失敗しました")
-                failed.append(pkg)
         print("インストール完了。起動します...\n")
-        # Windows では os.execv が正しく動作しないため subprocess で再起動
         if platform.system() == "Windows":
             ret = subprocess.call([sys.executable] + sys.argv)
             sys.exit(ret)
@@ -59,6 +64,36 @@ def _ensure_packages():
 def _importable(name):
     import importlib.util
     return importlib.util.find_spec(name) is not None
+
+
+# AI系の重量級パッケージは process() 実行時に遅延インストール
+_AI_PACKAGES = [
+    # (import_name, pip_name, install_args)
+    ("torch",        "torch",       ["torch", "--index-url", "https://download.pytorch.org/whl/cpu"]),
+    ("demucs",       "demucs",      ["demucs"]),
+    ("basic_pitch",  "basic-pitch", ["basic-pitch"]),
+]
+
+
+def _ensure_ai_packages(log=print):
+    """AIモード起動時に重量級パッケージを確保する（初回のみ大きなダウンロード）"""
+    missing = [(imp, pkg, args) for imp, pkg, args in _AI_PACKAGES
+               if not _importable(imp)]
+    if not missing:
+        return True
+    log(f"AIモデル用パッケージを導入中 (初回のみ、約1-2GB): {', '.join(p for _, p, _ in missing)}")
+    for imp, pkg, args in missing:
+        log(f"  インストール中: {pkg} ...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-q"] + args,
+                stderr=subprocess.STDOUT
+            )
+            log(f"  ✓ {pkg}")
+        except subprocess.CalledProcessError as e:
+            log(f"  ✗ {pkg} のインストールに失敗: {e}")
+            return False
+    return True
 
 
 try:
@@ -202,6 +237,123 @@ _FFMPEG_OK = _setup_ffmpeg()
 
 
 # =====================================================
+# SoundFont / FluidSynth 自動セットアップ
+# =====================================================
+
+_SF2_CONFIG = Path(__file__).parent / ".sf2_path.json"
+_ASSETS_DIR = Path(__file__).parent / "_assets"
+
+# 無料で商用可な汎用GM SoundFont（失敗時の候補を複数用意）
+_SF2_DOWNLOADS = [
+    # (表示名, URL, 想定サイズMB)
+    ("MuseScore General (Lite)",
+     "https://ftp.osuosl.org/pub/musescore/soundfont/MS%20Basic/MS%20Basic.sf3", 30),
+    ("GeneralUser GS",
+     "https://www.schristiancollins.com/generaluser/GeneralUser_GS_1.471.zip", 30),
+]
+
+
+def _find_sf2():
+    """SoundFont (.sf2/.sf3) のパスを解決する"""
+    # 1. 前回保存したパス
+    if _SF2_CONFIG.exists():
+        try:
+            saved = json.loads(_SF2_CONFIG.read_text())
+            p = saved.get("path", "")
+            if p and Path(p).exists():
+                return p
+        except Exception:
+            pass
+
+    # 2. アセットディレクトリを検索
+    if _ASSETS_DIR.exists():
+        for ext in ("*.sf2", "*.sf3"):
+            for p in _ASSETS_DIR.glob(ext):
+                return str(p)
+
+    # 3. よくあるシステム設置場所
+    candidates = []
+    if platform.system() == "Windows":
+        candidates += [
+            r"C:\ProgramData\soundfonts\default.sf2",
+            r"C:\Program Files\MuseScore 4\sound\MS Basic.sf3",
+            r"C:\Program Files\MuseScore 3\sound\MuseScore_General.sf3",
+        ]
+    elif platform.system() == "Darwin":
+        candidates += [
+            "/Applications/MuseScore 4.app/Contents/Resources/sound/MS Basic.sf3",
+            "/Library/Audio/Sounds/Banks/default.sf2",
+        ]
+    else:
+        candidates += [
+            "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+            "/usr/share/sounds/sf2/default-GM.sf2",
+            "/usr/share/soundfonts/default.sf2",
+            "/usr/share/soundfonts/FluidR3_GM.sf2",
+        ]
+    for c in candidates:
+        if Path(c).exists():
+            _save_sf2(c)
+            return c
+    return None
+
+
+def _save_sf2(path):
+    try:
+        _SF2_CONFIG.write_text(json.dumps({"path": str(path)}))
+    except Exception:
+        pass
+
+
+def _download_sf2(log=print):
+    """SoundFont が無ければ自動ダウンロードする"""
+    _ASSETS_DIR.mkdir(exist_ok=True)
+    import urllib.request
+    import zipfile
+    for name, url, size in _SF2_DOWNLOADS:
+        log(f"  SoundFont をダウンロード中 ({name}, 約{size}MB)...")
+        try:
+            fname = url.rsplit("/", 1)[-1].replace("%20", "_")
+            dest = _ASSETS_DIR / fname
+            urllib.request.urlretrieve(url, dest)
+            if dest.suffix.lower() == ".zip":
+                with zipfile.ZipFile(dest) as zf:
+                    for member in zf.namelist():
+                        if member.lower().endswith((".sf2", ".sf3")):
+                            zf.extract(member, _ASSETS_DIR)
+                            extracted = _ASSETS_DIR / member
+                            _save_sf2(str(extracted))
+                            log(f"  ✓ {extracted.name}")
+                            return str(extracted)
+                dest.unlink(missing_ok=True)
+                continue
+            _save_sf2(str(dest))
+            log(f"  ✓ {dest.name}")
+            return str(dest)
+        except Exception as e:
+            log(f"  ✗ {name} 取得失敗: {e}")
+            continue
+    return None
+
+
+def _setup_fluidsynth():
+    """pyfluidsynth の利用可否を判定する"""
+    if not _importable("fluidsynth"):
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "pyfluidsynth", "-q"],
+                stderr=subprocess.DEVNULL
+            )
+        except subprocess.CalledProcessError:
+            return False
+    try:
+        import fluidsynth  # noqa
+        return True
+    except Exception:
+        return False
+
+
+# =====================================================
 # 音楽分析エンジン
 # =====================================================
 
@@ -211,7 +363,17 @@ SEMI = 2 ** (1 / 12)
 
 
 class EarCopyEngine:
-    """v6.0 - 最高精度・15楽器フルオーケストラ耳コピエンジン"""
+    """v7.0 - Demucs + Basic Pitch + FluidSynth を主軸とした原曲忠実エンジン
+
+    モード:
+      - "ai"      : Demucs でステム分離 → Basic Pitch で多声部採譜 → FluidSynth 合成
+                    （未セットアップ時は v6 加算合成にフォールバック）
+      - "karaoke" : Demucs でボーカル除去のみ（伴奏はそのまま出力、最も原曲に近い）
+      - "classic" : v6.0 同等の CQT+pyin 解析＆加算合成（依存最小）
+      - "blend"   : 原曲ステム + 合成MIDI を指定比率でブレンド
+
+    blend_ratio: 0.0 (合成のみ) 〜 1.0 (原曲のみ)
+    """
 
     MIDI_MAP = {
         'piano': (0, 0), 'e_piano': (1, 4), 'glockenspiel': (2, 9),
@@ -234,8 +396,10 @@ class EarCopyEngine:
     NOTE_MIDI = {'C':0,'C#':1,'D':2,'D#':3,'E':4,'F':5,
                  'F#':6,'G':7,'G#':8,'A':9,'A#':10,'B':11}
 
-    def __init__(self, on_progress=None):
+    def __init__(self, on_progress=None, mode="ai", blend_ratio=0.0):
         self._cb = on_progress
+        self.mode = mode  # "ai" | "karaoke" | "classic" | "blend"
+        self.blend_ratio = max(0.0, min(1.0, blend_ratio))
 
     def _log(self, msg, pct=None):
         if self._cb:
@@ -506,9 +670,25 @@ class EarCopyEngine:
 
         return parts
 
-    # ---- メイン処理 --------------------------------------
+    # ---- メイン処理ディスパッチャー ---------------------
 
     def process(self, input_path: str, output_path: str):
+        """モードに応じて処理を分岐する"""
+        try:
+            if self.mode == "classic":
+                return self._process_classic(input_path, output_path)
+            if self.mode == "karaoke":
+                return self._process_karaoke(input_path, output_path)
+            # "ai" または "blend" はAIパイプライン
+            return self._process_ai(input_path, output_path)
+        except Exception as e:
+            import traceback
+            self._log(f"エラー: {e}", -1)
+            return False, traceback.format_exc()
+
+    # ---- Classic (v6.0 互換) ----------------------------
+
+    def _process_classic(self, input_path: str, output_path: str):
         try:
             y, sr = self._load(input_path)
             duration = len(y) / sr
@@ -559,6 +739,476 @@ class EarCopyEngine:
             import traceback
             self._log(f"エラー: {e}", -1)
             return False, traceback.format_exc()
+
+    # ============================================================
+    # v7.0: AI パイプライン (Demucs + Basic Pitch + FluidSynth)
+    # ============================================================
+
+    def _process_ai(self, input_path: str, output_path: str):
+        """Demucs + Basic Pitch の主パイプライン"""
+        self._log("AIモデル準備中...", 2)
+        if not _ensure_ai_packages(lambda m: self._log(m, 3)):
+            self._log("AIパッケージ取得に失敗、Classic モードへフォールバック", 5)
+            return self._process_classic(input_path, output_path)
+
+        # 1. 原音ロード
+        y, sr = self._load(input_path)
+        duration = len(y) / sr
+
+        # 2. Demucs でステム分離
+        self._log("Demucs でステム分離中 (初回はモデル~80MBをダウンロード)...", 8)
+        stems = self._demucs_separate(input_path)
+        if stems is None:
+            self._log("Demucs 失敗、Classic モードへフォールバック", 12)
+            return self._process_classic(input_path, output_path)
+
+        # 3. 各ステムから採譜
+        tempo, beats = self._tempo(y, sr)
+        self._log(f"テンポ: {tempo:.1f} BPM", 28)
+
+        self._log("ボーカル/その他を多声部採譜中 (Basic Pitch)...", 32)
+        vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
+        self._log(f"  ボーカル: {len(vocal_notes)} 音符", 45)
+
+        other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
+        self._log(f"  その他: {len(other_notes)} 音符", 58)
+
+        self._log("ベースライン採譜中 (pyin)...", 62)
+        bass_notes = self._pyin_bass_notes(stems["bass"], sr)
+        self._log(f"  ベース: {len(bass_notes)} 音符", 68)
+
+        self._log("ドラム採譜中...", 70)
+        drum_events = self._drums_from_stem(stems["drums"], sr)
+        self._log(f"  ドラム: {len(drum_events)} イベント", 74)
+
+        # 4. AI検出結果を15楽器パートに割り当て
+        parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
+
+        # 5. MIDI 保存
+        self._log("MIDIを保存中...", 78)
+        midi_path = str(Path(output_path).with_suffix(".mid"))
+        self._save_midi(parts, drum_events, tempo, midi_path)
+
+        # 6. 音声合成: FluidSynth 優先、失敗時は加算合成
+        self._log("音声合成中...", 82)
+        audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
+
+        # 7. ブレンドモード / karaoke 合成
+        if self.mode == "blend" and self.blend_ratio > 0:
+            self._log(f"原曲と合成をブレンド中 (原曲 {self.blend_ratio*100:.0f}%)...", 88)
+            mix = self._mix_stems(stems, include_vocals=False)
+            audio = self._blend(audio, mix, sr, self.blend_ratio)
+
+        # 8. マスタリング
+        audio = self._master(audio)
+
+        # 9. 保存
+        self._log("MP3を保存中...", 94)
+        self._save_mp3(audio, output_path)
+
+        self._log("完了！", 100)
+        return True, output_path
+
+    def _process_karaoke(self, input_path: str, output_path: str):
+        """ボーカル除去のみ（原曲クオリティそのまま）"""
+        self._log("AIモデル準備中...", 2)
+        if not _ensure_ai_packages(lambda m: self._log(m, 3)):
+            return False, "AIパッケージが必要です"
+
+        y, sr = self._load(input_path)
+        duration = len(y) / sr
+
+        self._log("Demucs でボーカル分離中...", 15)
+        stems = self._demucs_separate(input_path)
+        if stems is None:
+            return False, "Demucs でのステム分離に失敗しました"
+
+        self._log("伴奏をミックス中...", 75)
+        inst = self._mix_stems(stems, include_vocals=False)
+        inst = self._master(inst)
+
+        # MIDI も参考用に出力
+        tempo, _ = self._tempo(y, sr)
+        self._log("参考 MIDI を作成中...", 85)
+        bass_notes = self._pyin_bass_notes(stems["bass"], sr)
+        other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
+        vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
+        drum_events = self._drums_from_stem(stems["drums"], sr)
+        parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
+        midi_path = str(Path(output_path).with_suffix(".mid"))
+        self._save_midi(parts, drum_events, tempo, midi_path)
+
+        self._log("MP3を保存中...", 94)
+        self._save_mp3(inst, output_path)
+        self._log("完了！", 100)
+        return True, output_path
+
+    # ---- Demucs ステム分離 --------------------------------
+
+    def _demucs_separate(self, input_path):
+        """Demucs (htdemucs) でステム分離し、dict{name: ndarray} を返す"""
+        try:
+            import torch
+            from demucs.pretrained import get_model
+            from demucs.apply import apply_model
+            from demucs.audio import AudioFile, convert_audio
+        except Exception as e:
+            self._log(f"Demucs インポート失敗: {e}", -1)
+            return None
+
+        try:
+            model = get_model("htdemucs")
+            model.cpu()
+            model.eval()
+
+            wav = AudioFile(input_path).read(
+                streams=0, samplerate=model.samplerate, channels=model.audio_channels
+            )
+            ref = wav.mean(0)
+            wav = (wav - ref.mean()) / (ref.std() + 1e-8)
+
+            with torch.no_grad():
+                sources = apply_model(
+                    model, wav[None], device="cpu",
+                    split=True, overlap=0.15, progress=False
+                )[0]
+            sources = sources * ref.std() + ref.mean()
+
+            # htdemucs: sources は [drums, bass, other, vocals]
+            names = model.sources
+            out = {}
+            for name, src in zip(names, sources):
+                # モノラル化して SR にリサンプル
+                audio = src.mean(0).cpu().numpy()
+                if model.samplerate != SR:
+                    audio = librosa.resample(audio, orig_sr=model.samplerate, target_sr=SR)
+                out[name] = audio.astype(np.float32)
+            return out
+        except Exception as e:
+            import traceback
+            self._log(f"Demucs 実行エラー: {e}", -1)
+            traceback.print_exc()
+            return None
+
+    def _mix_stems(self, stems, include_vocals=True, gains=None):
+        """ステムをモノミックスする"""
+        if gains is None:
+            gains = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
+        if not include_vocals:
+            gains = {**gains, "vocals": 0.0}
+        max_len = max(len(s) for s in stems.values())
+        mix = np.zeros(max_len, dtype=np.float32)
+        for name, s in stems.items():
+            g = gains.get(name, 1.0)
+            if g == 0 or len(s) == 0:
+                continue
+            mix[:len(s)] += s * g
+        return mix
+
+    # ---- Basic Pitch 多声部採譜 ---------------------------
+
+    def _basic_pitch_notes(self, audio, sr, is_vocal=False):
+        """Basic Pitch で多声部採譜し [(t, dur, midi, vel), ...] を返す"""
+        try:
+            from basic_pitch.inference import predict
+            from basic_pitch import ICASSP_2022_MODEL_PATH
+        except Exception as e:
+            self._log(f"Basic Pitch インポート失敗、fallback: {e}", -1)
+            return self._fallback_transcribe(audio, sr, is_vocal)
+
+        # Basic Pitch は 22050Hz を期待
+        target_sr = 22050
+        if sr != target_sr:
+            audio_22k = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+        else:
+            audio_22k = audio
+
+        # Basic Pitch は ndarray を直接受け付けない版もあるため wav 一時ファイル経由
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp = f.name
+        try:
+            sf.write(tmp, audio_22k, target_sr)
+            try:
+                _, _, note_events = predict(
+                    tmp,
+                    model_or_model_path=str(ICASSP_2022_MODEL_PATH),
+                    onset_threshold=0.5 if is_vocal else 0.4,
+                    frame_threshold=0.3,
+                    minimum_note_length=80 if is_vocal else 60,
+                    minimum_frequency=65.0 if is_vocal else 32.0,
+                    maximum_frequency=2000.0 if is_vocal else 4000.0,
+                    melodia_trick=is_vocal,
+                    midi_tempo=120,
+                )
+            except TypeError:
+                # 古いAPI用の引数縮小
+                _, _, note_events = predict(tmp)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+        out = []
+        for ev in note_events:
+            # note_events は (start, end, pitch, amplitude, pitch_bends)
+            start = float(ev[0])
+            end = float(ev[1])
+            midi = int(ev[2])
+            amp = float(ev[3]) if len(ev) > 3 else 0.8
+            dur = max(end - start, 0.05)
+            vel = int(np.clip(40 + amp * 80, 30, 127))
+            out.append((start, dur, midi, vel))
+        return out
+
+    def _fallback_transcribe(self, audio, sr, is_vocal):
+        """Basic Pitch が使えない場合の pyin による単音採譜"""
+        fmin = librosa.note_to_hz("C3" if is_vocal else "C2")
+        fmax = librosa.note_to_hz("C6" if is_vocal else "C7")
+        f0, voiced, _ = librosa.pyin(audio, fmin=fmin, fmax=fmax, sr=sr, hop_length=HOP)
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
+        return self._f0_to_notes(f0, voiced, times, 8)
+
+    # ---- pyin ベース採譜 (Demucs ベースステム用) ----------
+
+    def _pyin_bass_notes(self, audio, sr):
+        """Demucs で分離されたベース音声を pyin で採譜"""
+        if np.max(np.abs(audio)) < 1e-4:
+            return []
+        f0, voiced, _ = librosa.pyin(
+            audio, fmin=librosa.note_to_hz("C1"),
+            fmax=librosa.note_to_hz("C3"), sr=sr, hop_length=HOP * 2
+        )
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP * 2)
+        return self._f0_to_notes(f0, voiced, times, 4)
+
+    # ---- ドラム (Demucs ドラムステム直接解析) --------------
+
+    def _drums_from_stem(self, audio, sr):
+        """Demucs で分離されたドラムステムをオンセット検出＋スペクトル分類"""
+        if np.max(np.abs(audio)) < 1e-4:
+            return []
+        onset_frames = librosa.onset.onset_detect(
+            y=audio, sr=sr, hop_length=HOP, backtrack=True, delta=0.06
+        )
+        onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=HOP)
+        events = []
+        for ot, of_ in zip(onset_times, onset_frames):
+            s = max(0, of_ - 2) * HOP
+            e = min(of_ + 8, len(audio) // HOP) * HOP
+            seg = audio[s:e]
+            if len(seg) < 8:
+                continue
+            fft = np.abs(np.fft.rfft(seg))
+            freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+            tot = fft.sum() + 1e-9
+            lo = fft[freqs < 120].sum() / tot
+            mid = fft[(freqs >= 200) & (freqs < 1500)].sum() / tot
+            hi = fft[freqs >= 3000].sum() / tot
+            if lo > 0.45:
+                kind = "kick"
+            elif hi > 0.45:
+                kind = "hihat"
+            elif mid > 0.3 and hi > 0.15:
+                kind = "ride"
+            else:
+                kind = "snare"
+            events.append((ot, kind))
+        return events
+
+    # ---- AI 検出結果 → 15楽器割り当て ----------------------
+
+    def _ai_assign_parts(self, vocal_notes, other_notes, bass_notes):
+        """AI採譜結果を v6 互換の15パート形式に割り当てる"""
+        parts = {name: [] for name in self.MIDI_MAP}
+
+        # ボーカル系は主旋律 → ピアノ(主) + フルート/バイオリン(エコー)
+        for (t, dur, midi, vel) in vocal_notes:
+            parts['piano'].append((t, dur, midi, vel))
+            if midi >= 78:
+                parts['flute'].append((t, dur, midi, int(vel * 0.45)))
+            elif midi >= 64:
+                parts['violin'].append((t, dur, midi, int(vel * 0.5)))
+            else:
+                parts['choir'].append((t, dur, midi, int(vel * 0.3)))
+
+        # その他(伴奏) → 音域で楽器分け
+        for (t, dur, midi, vel) in other_notes:
+            if midi >= 84:
+                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.5)))
+            elif midi >= 72:
+                parts['e_piano'].append((t, dur, midi, int(vel * 0.6)))
+                if dur >= 0.35:
+                    parts['strings'].append((t, dur, midi, int(vel * 0.35)))
+            elif midi >= 60:
+                parts['guitar_clean'].append((t, dur, midi, int(vel * 0.7)))
+                if dur >= 0.4:
+                    parts['strings'].append((t, dur, midi, int(vel * 0.3)))
+            elif midi >= 48:
+                parts['guitar_nylon'].append((t, dur, midi, int(vel * 0.6)))
+                if dur >= 0.5:
+                    parts['pad'].append((t, dur, midi, int(vel * 0.3)))
+            else:
+                parts['cello'].append((t, dur, midi, int(vel * 0.7)))
+
+        # ベース
+        for (t, dur, midi, vel) in bass_notes:
+            parts['bass'].append((t, dur, midi, vel))
+            if midi + 12 < 55:
+                parts['cello'].append((t, dur, midi + 12, int(vel * 0.4)))
+
+        return parts
+
+    # ---- 合成 (FluidSynth 優先) ---------------------------
+
+    def _synthesize_audio(self, midi_path, parts, drum_events, duration):
+        """FluidSynth で合成、失敗時は v6 加算合成にフォールバック"""
+        audio = self._synthesize_fluidsynth(midi_path, duration)
+        if audio is not None:
+            return audio * 0.85
+        self._log("  FluidSynth 未使用、v6加算合成を使用", 84)
+        n = int((duration + 2.0) * SR)
+        audio = self._synth_parts(parts, n) * 0.75
+        audio += self._synth_drums(drum_events, n) * 0.50
+        return audio
+
+    def _synthesize_fluidsynth(self, midi_path, duration):
+        """FluidSynth + SoundFont で MIDI を合成する"""
+        sf2 = _find_sf2()
+        if sf2 is None:
+            self._log("  SoundFont が見つからないため自動取得を試みます...", 82)
+            sf2 = _download_sf2(lambda m: self._log(m, 83))
+        if sf2 is None:
+            return None
+        if not _setup_fluidsynth():
+            return None
+        try:
+            import fluidsynth
+        except Exception:
+            return None
+
+        try:
+            fs = fluidsynth.Synth(samplerate=float(SR), gain=0.6)
+            sfid = fs.sfload(sf2)
+            if sfid == -1:
+                return None
+
+            # MIDI をパースして直接 fluidsynth に送る
+            mid = MidiFile(midi_path)
+
+            # 各チャンネルの program を pre-assign
+            for ch, prog in [(info[0], info[1]) for info in self.MIDI_MAP.values()]:
+                fs.program_select(ch, sfid, 0, prog)
+            # ドラム (ch9) は bank 128 (GM drum kit)
+            try:
+                fs.program_select(9, sfid, 128, 0)
+            except Exception:
+                pass
+
+            # リアルタイム代わりに非リアルタイム書き出し
+            # pyfluidsynth は get_samples(n) で合成できる
+            total_seconds = mid.length + 2.0
+            total_frames = int(total_seconds * SR)
+            buf = np.zeros(total_frames * 2, dtype=np.int16)  # ステレオ
+
+            # イベントをタイムスタンプ付きでソートして逐次送信＆合成
+            events = []  # (time_sec, msg)
+            cur_time = {i: 0.0 for i in range(len(mid.tracks))}
+            tempo_us = 500_000  # デフォルト 120BPM
+            tpb = mid.ticks_per_beat
+            # 全トラック統合
+            merged = []
+            for ti, tr in enumerate(mid.tracks):
+                abs_ticks = 0
+                for msg in tr:
+                    abs_ticks += msg.time
+                    merged.append((abs_ticks, msg))
+            merged.sort(key=lambda x: x[0])
+
+            def ticks_to_sec(ticks, tempo):
+                return ticks * (tempo / 1_000_000.0) / tpb
+
+            cur_ticks = 0
+            cur_sec = 0.0
+            cursor_frame = 0
+            for abs_ticks, msg in merged:
+                dt_ticks = abs_ticks - cur_ticks
+                dt_sec = ticks_to_sec(dt_ticks, tempo_us)
+                cur_ticks = abs_ticks
+                # dt_sec 分 fluidsynth から samples を取得
+                n_frames = int(dt_sec * SR)
+                if n_frames > 0:
+                    samples = fs.get_samples(n_frames)
+                    end = cursor_frame + n_frames * 2
+                    if end > len(buf):
+                        end = len(buf)
+                        samples = samples[: end - cursor_frame]
+                    buf[cursor_frame:end] = samples[: end - cursor_frame]
+                    cursor_frame = end
+                cur_sec += dt_sec
+                # msg を fluidsynth に送る
+                if msg.type == "set_tempo":
+                    tempo_us = msg.tempo
+                elif msg.type == "program_change":
+                    try:
+                        fs.program_change(msg.channel, msg.program)
+                    except Exception:
+                        pass
+                elif msg.type == "note_on":
+                    if msg.velocity > 0:
+                        fs.noteon(msg.channel, msg.note, msg.velocity)
+                    else:
+                        fs.noteoff(msg.channel, msg.note)
+                elif msg.type == "note_off":
+                    fs.noteoff(msg.channel, msg.note)
+                elif msg.type == "control_change":
+                    try:
+                        fs.cc(msg.channel, msg.control, msg.value)
+                    except Exception:
+                        pass
+            # 最後のリバーブ残響分
+            tail = fs.get_samples(int(1.5 * SR))
+            end = min(cursor_frame + len(tail), len(buf))
+            buf[cursor_frame:end] = tail[: end - cursor_frame]
+            fs.delete()
+
+            # ステレオを float モノに
+            stereo = buf.reshape(-1, 2).astype(np.float32) / 32768.0
+            mono = stereo.mean(axis=1)
+            return mono
+        except Exception as e:
+            self._log(f"  FluidSynth 失敗: {e}", -1)
+            return None
+
+    # ---- ブレンド＆マスタリング ---------------------------
+
+    def _blend(self, synth_audio, orig_audio, sr, ratio):
+        """合成音と原曲をクロスブレンド (ratio=1.0 で原曲のみ)"""
+        n = max(len(synth_audio), len(orig_audio))
+        a = np.zeros(n, dtype=np.float32)
+        b = np.zeros(n, dtype=np.float32)
+        a[:len(synth_audio)] = synth_audio
+        b[:len(orig_audio)] = orig_audio
+        # RMS を揃える
+        rms_a = np.sqrt(np.mean(a**2) + 1e-9)
+        rms_b = np.sqrt(np.mean(b**2) + 1e-9)
+        b *= rms_a / rms_b
+        return (1 - ratio) * a + ratio * b
+
+    def _master(self, audio):
+        """簡易マスタリング: ソフトクリップ + ハイパスで低域ノイズ除去"""
+        if len(audio) == 0:
+            return audio.astype(np.float32)
+        # ハイパス 30Hz
+        nyq = SR / 2
+        b, a = butter(2, 30 / nyq, btype="high")
+        audio = filtfilt(b, a, audio).astype(np.float32)
+        # ノーマライズ + ソフトクリップ
+        peak = np.max(np.abs(audio))
+        if peak > 0:
+            audio = audio / peak * 0.95
+        audio = np.tanh(audio * 1.1) * 0.92
+        return audio.astype(np.float32)
 
     # ---- 音声読み込み ------------------------------------
 
@@ -872,14 +1522,16 @@ class App:
         else:
             self.root = tk.Tk()
 
-        self.root.title("耳コピ自動生成ツール v6.0")
-        self.root.geometry("620x520")
+        self.root.title("耳コピ自動生成ツール v7.0")
+        self.root.geometry("640x700")
         self.root.configure(bg=self.BG)
         self.root.resizable(False, False)
 
         self._out_dir  = tk.StringVar(value=str(Path.home() / "Desktop"))
         self._status   = tk.StringVar(value="MP3ファイルをドロップしてください")
         self._progress = tk.DoubleVar(value=0)
+        self._mode     = tk.StringVar(value="ai")
+        self._blend    = tk.DoubleVar(value=0.0)
         self._busy     = False
 
         self._build()
@@ -890,10 +1542,10 @@ class App:
         r = self.root
 
         # タイトル
-        tk.Label(r, text="耳コピ自動生成ツール v6.0",
+        tk.Label(r, text="耳コピ自動生成ツール v7.0",
                  font=("Helvetica", 20, "bold"),
                  bg=self.BG, fg=self.ACCENT).pack(pady=(20, 4))
-        tk.Label(r, text="MP3をAI分析 → 15楽器フルアレンジで自動トランスクリプション",
+        tk.Label(r, text="Demucs × Basic Pitch × FluidSynth で原曲忠実な耳コピ",
                  font=("Helvetica", 9), bg=self.BG, fg=self.FG2).pack()
 
         # ドロップゾーン
@@ -915,6 +1567,42 @@ class App:
             self._drop_lbl.dnd_bind("<<Drop>>",      self._drop)
             self._drop_lbl.dnd_bind("<<DragEnter>>", lambda e: self._hover(True))
             self._drop_lbl.dnd_bind("<<DragLeave>>", lambda e: self._hover(False))
+
+        # モード選択
+        mf = tk.LabelFrame(r, text="  モード  ",
+                           bg=self.BG, fg=self.FG2,
+                           font=("Helvetica", 9), bd=1, relief="flat")
+        mf.pack(padx=30, pady=(14, 0), fill="x")
+        modes = [
+            ("ai",      "AI耳コピ (Demucs+BasicPitch) / 推奨"),
+            ("blend",   "原曲ブレンド (AI耳コピ + 原曲ミックス)"),
+            ("karaoke", "カラオケ (ボーカル除去のみ / 最高忠実度)"),
+            ("classic", "Classic (v6.0軽量 / AI不要)"),
+        ]
+        for val, label in modes:
+            tk.Radiobutton(
+                mf, text=label, variable=self._mode, value=val,
+                bg=self.BG, fg=self.FG, selectcolor=self.BG2,
+                activebackground=self.BG, activeforeground=self.ACCENT,
+                font=("Helvetica", 9), anchor="w",
+                command=self._on_mode_change
+            ).pack(anchor="w", padx=8, pady=1)
+
+        # ブレンド比率スライダー
+        self._blend_frame = tk.Frame(mf, bg=self.BG)
+        self._blend_frame.pack(fill="x", padx=10, pady=(3, 6))
+        tk.Label(self._blend_frame, text="原曲ブレンド比率:",
+                 bg=self.BG, fg=self.FG2, font=("Helvetica", 8)
+                 ).pack(side="left")
+        self._blend_scale = tk.Scale(
+            self._blend_frame, from_=0.0, to=1.0, resolution=0.05,
+            orient="horizontal", variable=self._blend,
+            bg=self.BG, fg=self.FG, troughcolor=self.BG2,
+            highlightthickness=0, length=280, showvalue=True,
+            activebackground=self.ACCENT
+        )
+        self._blend_scale.pack(side="left", padx=(6, 0))
+        self._blend_frame.pack_forget()  # ai モードでは非表示
 
         # 出力先
         of = tk.Frame(r, bg=self.BG)
@@ -957,6 +1645,12 @@ class App:
 
     # ---- イベントハンドラ --------------------------------
 
+    def _on_mode_change(self):
+        if self._mode.get() == "blend":
+            self._blend_frame.pack(fill="x", padx=10, pady=(3, 6))
+        else:
+            self._blend_frame.pack_forget()
+
     def _hover(self, on):
         c = "#1e3a5f" if on else self.BG2
         self._drop_frame.configure(bg=c)
@@ -997,8 +1691,13 @@ class App:
         self._append_log(f"入力: {Path(path).name}")
         self._append_log(f"出力: {output}")
 
+        mode = self._mode.get()
+        blend = float(self._blend.get()) if mode == "blend" else 0.0
+
         def worker():
-            engine = EarCopyEngine(on_progress=self._on_prog)
+            engine = EarCopyEngine(
+                on_progress=self._on_prog, mode=mode, blend_ratio=blend
+            )
             ok, res = engine.process(path, output)
             self.root.after(0, lambda: (self._done(res) if ok else self._err(res)))
 
@@ -1053,10 +1752,14 @@ def _run_cli(args):
     """コマンドライン引数で直接処理を実行する"""
     import argparse
     parser = argparse.ArgumentParser(
-        description="耳コピ自動生成ツール v6.0 - MP3をAI分析して耳コピ音源を自動生成"
+        description="耳コピ自動生成ツール v7.0 - Demucs×BasicPitch×FluidSynth"
     )
     parser.add_argument("input", help="入力音楽ファイル（MP3/WAV/M4A/FLAC）")
     parser.add_argument("-o", "--output", help="出力MP3パス（省略時: 同じフォルダに 耳コピ_*.mp3）")
+    parser.add_argument("--mode", choices=["ai", "blend", "karaoke", "classic"],
+                        default="ai", help="処理モード (デフォルト: ai)")
+    parser.add_argument("--blend", type=float, default=0.0,
+                        help="blend モード時の原曲比率 0.0-1.0 (デフォルト: 0.0)")
     opts = parser.parse_args(args)
 
     inp = Path(opts.input)
@@ -1071,9 +1774,10 @@ def _run_cli(args):
 
     print(f"入力: {inp}")
     print(f"出力: {out}")
+    print(f"モード: {opts.mode}")
     print()
 
-    engine = EarCopyEngine()
+    engine = EarCopyEngine(mode=opts.mode, blend_ratio=opts.blend)
     ok, result = engine.process(str(inp), out)
 
     if ok:
