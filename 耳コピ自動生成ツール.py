@@ -262,11 +262,13 @@ _ASSETS_DIR = Path(__file__).parent / "_assets"
 
 # 無料で商用可な汎用GM SoundFont（失敗時の候補を複数用意）
 _SF2_DOWNLOADS = [
-    # (表示名, URL, 想定サイズMB)
-    ("MuseScore General (Lite)",
-     "https://ftp.osuosl.org/pub/musescore/soundfont/MS%20Basic/MS%20Basic.sf3", 30),
-    ("GeneralUser GS",
-     "https://www.schristiancollins.com/generaluser/GeneralUser_GS_1.471.zip", 30),
+    # (表示名, URL, 想定サイズMB, 拡張子)
+    ("TinySoundFont (GMGSx Lite)",
+     "https://github.com/schellingb/TinySoundFont/raw/master/tsf_test/tsf_test_gm.sf2", 8, "sf2"),
+    ("GeneralUser GS (Collins)",
+     "https://schristiancollins.com/soundfonts/GeneralUser_GS_v1.471.zip", 30, "zip"),
+    ("FluidR3_GM (Archive.org)",
+     "https://archive.org/download/fluidr3-gm-gs/FluidR3_GM.sf2", 140, "sf2"),
 ]
 
 
@@ -323,17 +325,36 @@ def _save_sf2(path):
 
 
 def _download_sf2(log=print):
-    """SoundFont が無ければ自動ダウンロードする"""
+    """SoundFont が無ければ自動ダウンロードする（複数URLを順に試行）"""
     _ASSETS_DIR.mkdir(exist_ok=True)
     import urllib.request
     import zipfile
-    for name, url, size in _SF2_DOWNLOADS:
+
+    for name, url, size, ext in _SF2_DOWNLOADS:
         log(f"  SoundFont をダウンロード中 ({name}, 約{size}MB)...")
         try:
             fname = url.rsplit("/", 1)[-1].replace("%20", "_")
+            if not fname.lower().endswith((".sf2", ".sf3", ".zip")):
+                fname = f"{name.replace(' ', '_')}.{ext}"
             dest = _ASSETS_DIR / fname
-            urllib.request.urlretrieve(url, dest)
-            if dest.suffix.lower() == ".zip":
+
+            # User-Agent を付けないと弾くサーバーがある
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (EarCopyTool)"
+            })
+            with urllib.request.urlopen(req, timeout=60) as r:
+                ct = r.headers.get("Content-Type", "").lower()
+                # HTMLが返ってきた場合は失敗扱い（リダイレクト先の案内ページなど）
+                if "text/html" in ct:
+                    raise RuntimeError(f"HTML応答を受信 (Content-Type: {ct})")
+                data = r.read()
+            if len(data) < 100_000:  # 100KB未満は怪しい
+                raise RuntimeError(f"ファイルサイズが小さすぎます ({len(data)} bytes)")
+            dest.write_bytes(data)
+
+            # ZIP判定はヘッダで確実に
+            is_zip = dest.suffix.lower() == ".zip" or data[:4] == b"PK\x03\x04"
+            if is_zip:
                 with zipfile.ZipFile(dest) as zf:
                     for member in zf.namelist():
                         if member.lower().endswith((".sf2", ".sf3")):
@@ -343,13 +364,52 @@ def _download_sf2(log=print):
                             log(f"  ✓ {extracted.name}")
                             return str(extracted)
                 dest.unlink(missing_ok=True)
+                log(f"  ✗ {name}: ZIPにSF2が含まれず")
                 continue
-            _save_sf2(str(dest))
-            log(f"  ✓ {dest.name}")
-            return str(dest)
+
+            # SF2ヘッダ検証 (RIFF...sfbk)
+            if len(data) > 16 and (data[:4] == b"RIFF" and b"sfbk" in data[:64]):
+                _save_sf2(str(dest))
+                log(f"  ✓ {dest.name}")
+                return str(dest)
+            dest.unlink(missing_ok=True)
+            log(f"  ✗ {name}: SF2フォーマット不正")
         except Exception as e:
             log(f"  ✗ {name} 取得失敗: {e}")
             continue
+    return None
+
+
+def _prompt_sf2_manually(log=print):
+    """自動DLが全滅した場合、ユーザーに手動選択を促す"""
+    try:
+        import tkinter as _tk
+        from tkinter import filedialog as _fd, messagebox as _mb
+        _root = _tk.Tk()
+        _root.withdraw()
+        yes = _mb.askyesno(
+            "SoundFontの自動取得に失敗",
+            "SoundFont (.sf2/.sf3) ファイルを手動で指定しますか？\n\n"
+            "【いいえ】を選ぶと v6.0 加算合成で音源を生成します。\n\n"
+            "【はい】を選ぶとファイル選択ダイアログが開きます。\n"
+            "お持ちでなければ、以下から無料ダウンロードできます:\n"
+            "  • https://member.keymusician.com/Member/FluidR3_GM/\n"
+            "  • https://schristiancollins.com/generaluser.php"
+        )
+        if not yes:
+            _root.destroy()
+            return None
+        path = _fd.askopenfilename(
+            title="SoundFont (.sf2 / .sf3) を選択",
+            filetypes=[("SoundFont", "*.sf2 *.sf3"), ("全て", "*")]
+        )
+        _root.destroy()
+        if path and Path(path).exists():
+            _save_sf2(path)
+            log(f"  ✓ 手動指定: {Path(path).name}")
+            return path
+    except Exception:
+        pass
     return None
 
 
@@ -1121,8 +1181,13 @@ class EarCopyEngine:
             self._log("  SoundFont が見つからないため自動取得を試みます...", 82)
             sf2 = _download_sf2(lambda m: self._log(m, 83))
         if sf2 is None:
+            self._log("  自動取得失敗、手動選択ダイアログを表示します...", 84)
+            sf2 = _prompt_sf2_manually(lambda m: self._log(m, 84))
+        if sf2 is None:
+            self._log("  SoundFontなし、v6加算合成を使用します", 84)
             return None
         if not _setup_fluidsynth():
+            self._log("  FluidSynthライブラリ未検出、v6加算合成を使用します", 84)
             return None
         try:
             import fluidsynth
