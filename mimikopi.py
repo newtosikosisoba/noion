@@ -987,6 +987,11 @@ class EarCopyEngine:
         other_notes = self._quantize_notes(other_notes, beats, tempo)
         bass_notes = self._quantize_notes(bass_notes, beats, tempo)
 
+        # ベロシティをステム別に正規化（ダイナミクスを揃える）
+        vocal_notes = self._normalize_velocity(vocal_notes, 55, 110)
+        other_notes = self._normalize_velocity(other_notes, 40, 105)
+        bass_notes  = self._normalize_velocity(bass_notes,  60, 115)
+
         # 5. AI検出結果を15楽器パートに割り当て
         parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
 
@@ -1006,6 +1011,9 @@ class EarCopyEngine:
 
         # 7. マスタリング
         audio = self._master(audio)
+
+        self._log("出力品質チェック中...", 91)
+        self._validate_output(audio, duration)
 
         # 9. 保存
         self._log("MP3を保存中...", 94)
@@ -1031,6 +1039,9 @@ class EarCopyEngine:
         self._log("伴奏をミックス中...", 75)
         inst = self._mix_stems(stems, include_vocals=False)
         inst = self._master(inst)
+
+        self._log("出力品質チェック中...", 91)
+        self._validate_output(inst, duration)
 
         # MIDI も参考用に出力
         tempo, _ = self._tempo(y, sr)
@@ -1329,6 +1340,22 @@ class EarCopyEngine:
         for (t, dur, midi, vel) in long_strings:
             parts['pad'].append((t, dur, midi, int(vel * 0.35)))
 
+        # === 5. ポリフォニー制限（位相干渉・音の濁り防止） ===
+        MAX_POLY = {'piano': 6, 'e_piano': 4, 'guitar_clean': 4,
+                    'guitar_nylon': 4, 'strings': 6, 'glockenspiel': 3,
+                    'cello': 3, 'bass': 1, 'pad': 4, 'choir': 4}
+        for name in parts:
+            limit = MAX_POLY.get(name, 4)
+            evts = sorted(parts[name], key=lambda x: x[0])
+            filtered = []
+            for note in evts:
+                t, dur = note[0], note[1]
+                active = sum(1 for ft, fd, _, _ in filtered
+                             if ft + fd > t and ft <= t)
+                if active < limit:
+                    filtered.append(note)
+            parts[name] = filtered
+
         return parts
 
     # ---- ノート量子化・正規化 ----------------------------
@@ -1369,6 +1396,18 @@ class EarCopyEngine:
             else:
                 seen[key] = (t, dur, midi, vel)
         return sorted(seen.values(), key=lambda x: x[0])
+
+    def _normalize_velocity(self, notes, target_min=45, target_max=115):
+        """ベロシティを target_min–target_max にスケーリング"""
+        if not notes:
+            return notes
+        vels = [v for _, _, _, v in notes]
+        v_min, v_max = min(vels), max(vels)
+        if v_max - v_min < 5:
+            return notes
+        scale = (target_max - target_min) / (v_max - v_min)
+        return [(t, dur, m, int(np.clip(target_min + (v - v_min) * scale, 1, 127)))
+                for t, dur, m, v in notes]
 
     def _estimate_key(self, audio, sr):
         """Krumhansl–Schmuckler キー推定。
@@ -1563,7 +1602,10 @@ class EarCopyEngine:
                 return None
 
             audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=True)
-            self._log(f"  ✓ FluidSynth レンダリング完了 ({len(audio)/SR:.1f}秒)", 88)
+            actual_dur = len(audio) / SR
+            if actual_dur < duration * 0.5:
+                self._log(f"  ⚠ FluidSynth出力が短い ({actual_dur:.1f}s / 期待{duration:.1f}s)", -1)
+            self._log(f"  ✓ FluidSynth レンダリング完了 ({actual_dur:.1f}秒)", 88)
             return audio
         except Exception as e:
             self._log(f"  FluidSynth 実行エラー: {e}", -1)
@@ -1632,16 +1674,27 @@ class EarCopyEngine:
         b, a = butter(2, min(18000 / nyq, 0.99), btype="low")
         audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # 簡易コンプレッサー（ブロック単位 RMS ベース）
-        block = int(SR * 0.02)  # 20ms ブロック
+        # エンベロープフォロワー付きコンプレッサー（滑らかなゲイン変化）
         threshold = 0.3
         ratio = 2.5
+        attack = np.exp(-1 / (SR * 0.005))   # 5ms attack
+        release = np.exp(-1 / (SR * 0.05))   # 50ms release
+        env = 0.0
+        gain_arr = np.ones(len(audio), dtype=np.float32)
+        block = 64
         for i in range(0, len(audio) - block, block):
             chunk = audio[i:i + block]
-            rms = np.sqrt(np.mean(chunk ** 2) + 1e-9)
-            if rms > threshold:
-                gain = threshold + (rms - threshold) / ratio
-                audio[i:i + block] *= gain / rms
+            peak = float(np.max(np.abs(chunk)))
+            if peak > env:
+                env = attack * env + (1 - attack) * peak
+            else:
+                env = release * env + (1 - release) * peak
+            if env > threshold:
+                desired_gain = (threshold + (env - threshold) / ratio) / max(env, 1e-9)
+            else:
+                desired_gain = 1.0
+            gain_arr[i:i + block] = desired_gain
+        audio *= gain_arr
 
         # ノーマライズ + ソフトクリップ
         peak = np.max(np.abs(audio))
@@ -1649,6 +1702,46 @@ class EarCopyEngine:
             audio = audio / peak * 0.95
         audio = np.tanh(audio * 1.05) * 0.93
         return audio.astype(np.float32)
+
+    def _validate_output(self, audio, duration):
+        """出力音声の品質チェック。問題があればログ警告を出す。"""
+        issues = []
+        actual_dur = len(audio) / SR
+        if actual_dur < duration * 0.9:
+            issues.append(f"出力が短い ({actual_dur:.1f}s / 期待 {duration:.1f}s)")
+        elif actual_dur > duration * 1.2:
+            issues.append(f"出力が長い ({actual_dur:.1f}s / 期待 {duration:.1f}s)")
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        if rms < 0.005:
+            issues.append(f"音量が極端に小さい (RMS={rms:.4f})")
+        clip_count = int(np.sum(np.abs(audio) > 0.99))
+        clip_ratio = clip_count / max(len(audio), 1)
+        if clip_ratio > 0.001:
+            issues.append(f"クリッピング検出 ({clip_count}サンプル, {clip_ratio*100:.2f}%)")
+        try:
+            check_len = min(len(audio), SR * 5)
+            fft = np.abs(np.fft.rfft(audio[:check_len]))
+            freqs = np.fft.rfftfreq(check_len, 1 / SR)
+            lo = fft[freqs < 200].sum()
+            mid = fft[(freqs >= 200) & (freqs < 4000)].sum()
+            hi = fft[freqs >= 4000].sum()
+            total = lo + mid + hi + 1e-9
+            if mid / total < 0.15:
+                issues.append("中域(200-4kHz)のエネルギーが不足")
+            if lo / total < 0.05:
+                issues.append("低域(〜200Hz)のエネルギーが不足")
+        except Exception:
+            pass
+        dc = float(np.mean(audio))
+        if abs(dc) > 0.01:
+            issues.append(f"DCオフセット検出 ({dc:.4f})")
+        if issues:
+            self._log("⚠ 出力品質チェック — 以下の問題を検出:", 92)
+            for iss in issues:
+                self._log(f"  • {iss}", 92)
+        else:
+            self._log("✓ 出力品質チェック OK (長さ・音量・スペクトル正常)", 92)
+        return len(issues) == 0
 
     # ---- 音声読み込み ------------------------------------
 
