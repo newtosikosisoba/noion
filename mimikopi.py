@@ -8,7 +8,9 @@ v7.0 の革新:
   - Demucs (Meta): ボーカル/ドラム/ベース/その他の AI ステム分離
   - Basic Pitch (Spotify): SOTA 多声部ポリフォニック MIDI 採譜
   - FluidSynth + SoundFont: 本物のサンプル音源による再合成
-  - 原曲ブレンド: 原曲ステムと合成MIDIを任意比率でミックス
+  - ハイブリッドミックス: 合成MIDI音源に原音ステムをRMS正規化ブレンド
+  - キー推定＆スケールスナップ: ボーカル音程のAI自動補正
+  - 出力品質チェック: 長さ/音量/スペクトル/クリッピングの自動検証
   - v6.0 の加算合成はフォールバックとして残存
 
 必要環境: Python 3.8+
@@ -1477,8 +1479,13 @@ class EarCopyEngine:
             try:
                 from scipy.signal import iirpeak
                 b, a = iirpeak(2500 / (SR / 2), Q=1.0)
-                boosted = filtfilt(b, a, audio).astype(np.float32)
-                audio = (audio * 0.80 + boosted * 0.20).astype(np.float32)
+                if audio.ndim == 2:
+                    for ch in range(audio.shape[1]):
+                        boosted = filtfilt(b, a, audio[:, ch]).astype(np.float32)
+                        audio[:, ch] = audio[:, ch] * 0.80 + boosted * 0.20
+                else:
+                    boosted = filtfilt(b, a, audio).astype(np.float32)
+                    audio = (audio * 0.80 + boosted * 0.20).astype(np.float32)
             except Exception:
                 pass
             return audio * 0.90
@@ -1601,7 +1608,9 @@ class EarCopyEngine:
                         self._log(f"    {line}", -1)
                 return None
 
-            audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=True)
+            audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=False)
+            if audio.ndim == 2:
+                audio = audio.T.astype(np.float32)  # (2, N) → (N, 2)
             actual_dur = len(audio) / SR
             if actual_dur < duration * 0.5:
                 self._log(f"  ⚠ FluidSynth出力が短い ({actual_dur:.1f}s / 期待{duration:.1f}s)", -1)
@@ -1622,22 +1631,24 @@ class EarCopyEngine:
     # ---- ハイブリッドミックス＆マスタリング ----------------
 
     def _hybrid_mix(self, synth_audio, stems):
-        """合成音にドラム/ベース原音ステムをRMS正規化して加算する。
+        """合成音にドラム/ベース/other原音ステムをRMS正規化して加算する。
 
-        曲ごとの音量バランスを安定させるため、合成音のRMSを基準に
-        各ステムを目標レシオまで持ち上げる。
+        ステレオ対応: FluidSynth出力がステレオ(N,2)の場合はステレオ維持。
+        モノステムはセンターパンとしてステレオに展開してから加算。
         """
+        is_stereo = synth_audio.ndim == 2
         n = len(synth_audio)
-        out = np.zeros(n, dtype=np.float32)
-        out[:n] += synth_audio
+        out = synth_audio.copy().astype(np.float32)
 
-        rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
+        if is_stereo:
+            rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
+        else:
+            rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
 
         def _add_stem(stem, target_ratio, kind=None):
             if stem is None or len(stem) == 0 or rms_synth <= 1e-6:
                 return
             seg = stem[:n] if len(stem) >= n else np.pad(stem, (0, n - len(stem)))
-            # 帯域フィルタ適用（RMS計測前）
             nyq = SR / 2
             if kind == "drums":
                 b, a = butter(2, 80 / nyq, btype="high")
@@ -1648,41 +1659,60 @@ class EarCopyEngine:
             rms_stem = float(np.sqrt(np.mean(seg ** 2) + 1e-9))
             if rms_stem <= 1e-6:
                 return
-            # 目標 RMS = 合成音 RMS * target_ratio
             gain = (rms_synth * target_ratio) / rms_stem
-            # 過大ゲイン抑制（ピーク 0.95 を超えないよう制限）
             peak = float(np.max(np.abs(seg)))
             if peak * gain > 0.95:
                 gain = 0.95 / max(peak, 1e-6)
-            out[:n] += seg * gain
+            if is_stereo:
+                out[:n] += np.column_stack([seg * gain, seg * gain])
+            else:
+                out[:n] += seg * gain
 
         _add_stem(stems.get("drums"), target_ratio=0.85, kind="drums")
         _add_stem(stems.get("bass"),  target_ratio=0.50, kind="bass")
+        _add_stem(stems.get("other"), target_ratio=0.25, kind="other")
         return out
 
     def _master(self, audio):
-        """マスタリング: HP/LP EQ → コンプレッサー → ソフトクリップ"""
+        """マスタリング: DC除去 → HP/LP EQ → コンプレッサー → ソフトクリップ
+        モノ (N,) とステレオ (N,2) の両方に対応。
+        """
         if len(audio) == 0:
             return audio.astype(np.float32)
+
+        is_stereo = audio.ndim == 2
+
+        # DC オフセット除去
+        audio = (audio - np.mean(audio, axis=0)).astype(np.float32)
+
         nyq = SR / 2
 
-        # ハイパス 35Hz (超低域ノイズ除去)
+        # ハイパス 35Hz
         b, a = butter(3, 35 / nyq, btype="high")
-        audio = filtfilt(b, a, audio).astype(np.float32)
+        if is_stereo:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = filtfilt(b, a, audio[:, ch]).astype(np.float32)
+        else:
+            audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # ローパス 18kHz (超高域を自然に抑制)
+        # ローパス 18kHz
         b, a = butter(2, min(18000 / nyq, 0.99), btype="low")
-        audio = filtfilt(b, a, audio).astype(np.float32)
+        if is_stereo:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = filtfilt(b, a, audio[:, ch]).astype(np.float32)
+        else:
+            audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # エンベロープフォロワー付きコンプレッサー（滑らかなゲイン変化）
+        # エンベロープフォロワー付きコンプレッサー（リンクドステレオ）
         threshold = 0.3
         ratio = 2.5
-        attack = np.exp(-1 / (SR * 0.005))   # 5ms attack
-        release = np.exp(-1 / (SR * 0.05))   # 50ms release
+        attack = np.exp(-1 / (SR * 0.005))
+        release = np.exp(-1 / (SR * 0.05))
         env = 0.0
-        gain_arr = np.ones(len(audio), dtype=np.float32)
+        n_samples = len(audio)
+        gain_arr = np.ones(n_samples, dtype=np.float32)
         block = 64
-        for i in range(0, len(audio) - block, block):
+        for i in range(0, n_samples - block, block):
             chunk = audio[i:i + block]
             peak = float(np.max(np.abs(chunk)))
             if peak > env:
@@ -1694,7 +1724,10 @@ class EarCopyEngine:
             else:
                 desired_gain = 1.0
             gain_arr[i:i + block] = desired_gain
-        audio *= gain_arr
+        if is_stereo:
+            audio *= gain_arr[:, np.newaxis]
+        else:
+            audio *= gain_arr
 
         # ノーマライズ + ソフトクリップ
         peak = np.max(np.abs(audio))
@@ -1704,23 +1737,27 @@ class EarCopyEngine:
         return audio.astype(np.float32)
 
     def _validate_output(self, audio, duration):
-        """出力音声の品質チェック。問題があればログ警告を出す。"""
+        """出力音声の品質チェック。モノ/ステレオ両対応。"""
         issues = []
-        actual_dur = len(audio) / SR
+        # ステレオの場合はチャンネル平均でチェック
+        check = audio.mean(axis=1) if audio.ndim == 2 else audio
+        fmt = "ステレオ" if audio.ndim == 2 else "モノラル"
+
+        actual_dur = len(check) / SR
         if actual_dur < duration * 0.9:
             issues.append(f"出力が短い ({actual_dur:.1f}s / 期待 {duration:.1f}s)")
         elif actual_dur > duration * 1.2:
             issues.append(f"出力が長い ({actual_dur:.1f}s / 期待 {duration:.1f}s)")
-        rms = float(np.sqrt(np.mean(audio ** 2)))
+        rms = float(np.sqrt(np.mean(check ** 2)))
         if rms < 0.005:
             issues.append(f"音量が極端に小さい (RMS={rms:.4f})")
         clip_count = int(np.sum(np.abs(audio) > 0.99))
-        clip_ratio = clip_count / max(len(audio), 1)
+        clip_ratio = clip_count / max(audio.size, 1)
         if clip_ratio > 0.001:
             issues.append(f"クリッピング検出 ({clip_count}サンプル, {clip_ratio*100:.2f}%)")
         try:
-            check_len = min(len(audio), SR * 5)
-            fft = np.abs(np.fft.rfft(audio[:check_len]))
+            check_len = min(len(check), SR * 5)
+            fft = np.abs(np.fft.rfft(check[:check_len]))
             freqs = np.fft.rfftfreq(check_len, 1 / SR)
             lo = fft[freqs < 200].sum()
             mid = fft[(freqs >= 200) & (freqs < 4000)].sum()
@@ -1736,11 +1773,11 @@ class EarCopyEngine:
         if abs(dc) > 0.01:
             issues.append(f"DCオフセット検出 ({dc:.4f})")
         if issues:
-            self._log("⚠ 出力品質チェック — 以下の問題を検出:", 92)
+            self._log(f"⚠ 出力品質チェック ({fmt}) — 以下の問題を検出:", 92)
             for iss in issues:
                 self._log(f"  • {iss}", 92)
         else:
-            self._log("✓ 出力品質チェック OK (長さ・音量・スペクトル正常)", 92)
+            self._log(f"✓ 出力品質チェック OK ({fmt}, 長さ・音量・スペクトル正常)", 92)
         return len(issues) == 0
 
     # ---- 音声読み込み ------------------------------------
@@ -2167,10 +2204,15 @@ class EarCopyEngine:
             )
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp = f.name
-        sf.write(tmp, audio, SR)
-        seg = AudioSegment.from_wav(tmp)
-        seg.export(path, format="mp3", bitrate="192k")
-        os.unlink(tmp)
+        try:
+            sf.write(tmp, audio, SR)
+            seg = AudioSegment.from_wav(tmp)
+            seg.export(path, format="mp3", bitrate="320k")
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     # ---- パート別 MIDI パン・ボリューム・エフェクト設定 -----
 
