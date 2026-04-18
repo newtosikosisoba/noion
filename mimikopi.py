@@ -15,9 +15,12 @@ v7.0 の革新:
 初回起動時に依存パッケージを自動インストールします（AIモード時は約1-2GB）
 
 使い方:
-  GUI:  python 耳コピ自動生成ツール.py
-  CLI:  python 耳コピ自動生成ツール.py input.mp3 [-o output.mp3] [--mode MODE]
-        MODE: ai (Demucs+BasicPitch / デフォルト) | classic (v6.0相当) | karaoke (伴奏のみ)
+  GUI:  python mimikopi.py
+  CLI:  python mimikopi.py input.mp3 [-o output.mp3] [--mode MODE]
+        MODE: ai (Demucs+BasicPitch / デフォルト)
+              ai_inst (AI耳コピ・ガイドメロディなし / カラオケ伴奏向け)
+              karaoke (ボーカル除去のみ / 最高忠実度)
+              classic (v6.0相当 / 軽量)
 """
 
 import os
@@ -556,11 +559,9 @@ class EarCopyEngine:
     モード:
       - "ai"      : Demucs でステム分離 → Basic Pitch で多声部採譜 → FluidSynth 合成
                     （未セットアップ時は v6 加算合成にフォールバック）
+      - "ai_inst" : ai と同じパイプラインだがボーカルを完全に除去（カラオケ伴奏向け）
       - "karaoke" : Demucs でボーカル除去のみ（伴奏はそのまま出力、最も原曲に近い）
       - "classic" : v6.0 同等の CQT+pyin 解析＆加算合成（依存最小）
-      - "blend"   : 原曲ステム + 合成MIDI を指定比率でブレンド
-
-    blend_ratio: 0.0 (合成のみ) 〜 1.0 (原曲のみ)
     """
 
     MIDI_MAP = {
@@ -584,10 +585,9 @@ class EarCopyEngine:
     NOTE_MIDI = {'C':0,'C#':1,'D':2,'D#':3,'E':4,'F':5,
                  'F#':6,'G':7,'G#':8,'A':9,'A#':10,'B':11}
 
-    def __init__(self, on_progress=None, mode="ai", blend_ratio=0.0):
+    def __init__(self, on_progress=None, mode="ai"):
         self._cb = on_progress
-        self.mode = mode  # "ai" | "karaoke" | "classic" | "blend"
-        self.blend_ratio = max(0.0, min(1.0, blend_ratio))
+        self.mode = mode  # "ai" | "ai_inst" | "karaoke" | "classic"
 
     def _log(self, msg, pct=None):
         if self._cb:
@@ -867,7 +867,7 @@ class EarCopyEngine:
                 return self._process_classic(input_path, output_path)
             if self.mode == "karaoke":
                 return self._process_karaoke(input_path, output_path)
-            # "ai" または "blend" はAIパイプライン
+            # "ai" または "ai_inst" はAIパイプライン
             return self._process_ai(input_path, output_path)
         except Exception as e:
             import traceback
@@ -954,10 +954,16 @@ class EarCopyEngine:
         tempo, beats = self._tempo(y, sr)
         self._log(f"テンポ: {tempo:.1f} BPM", 28)
 
-        self._log("ボーカル/その他を多声部採譜中 (Basic Pitch)...", 32)
-        vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
-        self._log(f"  ボーカル: {len(vocal_notes)} 音符", 45)
+        skip_vocal = (self.mode == "ai_inst")
+        if skip_vocal:
+            self._log("ガイドメロディなしモード: ボーカル採譜をスキップ", 32)
+            vocal_notes = []
+        else:
+            self._log("ボーカルを多声部採譜中 (Basic Pitch)...", 32)
+            vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
+            self._log(f"  ボーカル: {len(vocal_notes)} 音符", 45)
 
+        self._log("その他楽器を多声部採譜中 (Basic Pitch)...", 50)
         other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
         self._log(f"  その他: {len(other_notes)} 音符", 58)
 
@@ -988,33 +994,11 @@ class EarCopyEngine:
         self._log("音声合成中...", 82)
         synth_audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
 
-        # ドラム・ベースの原音ステムをブレンド（品質大幅向上）
+        # ハイブリッドミキシング: 合成音を基準に、原音ステムをRMS正規化して加算
         self._log("ハイブリッドミキシング中...", 88)
-        n = len(synth_audio)
-        hybrid = np.zeros(n, dtype=np.float32)
-        hybrid[:len(synth_audio)] += synth_audio
+        audio = self._hybrid_mix(synth_audio, stems)
 
-        # 原音ドラムステムを加算（合成ドラムより圧倒的に高品質）
-        drums_orig = stems["drums"]
-        if len(drums_orig) > 0:
-            dn = min(len(drums_orig), n)
-            hybrid[:dn] += drums_orig[:dn] * 0.65
-
-        # 原音ベースステムを加算（pyin 単音検出の限界を補完）
-        bass_orig = stems["bass"]
-        if len(bass_orig) > 0:
-            bn = min(len(bass_orig), n)
-            hybrid[:bn] += bass_orig[:bn] * 0.40
-
-        audio = hybrid
-
-        # 7. ブレンドモード
-        if self.mode == "blend" and self.blend_ratio > 0:
-            self._log(f"原曲と合成をブレンド中 (原曲 {self.blend_ratio*100:.0f}%)...", 90)
-            mix = self._mix_stems(stems, include_vocals=False)
-            audio = self._blend(audio, mix, sr, self.blend_ratio)
-
-        # 8. マスタリング
+        # 7. マスタリング
         audio = self._master(audio)
 
         # 9. 保存
@@ -1180,9 +1164,9 @@ class EarCopyEngine:
                 _, _, note_events = predict(
                     tmp,
                     model_or_model_path=str(ICASSP_2022_MODEL_PATH),
-                    onset_threshold=0.5 if is_vocal else 0.4,
+                    onset_threshold=0.5 if is_vocal else 0.35,
                     frame_threshold=0.3,
-                    minimum_note_length=80 if is_vocal else 60,
+                    minimum_note_length=80 if is_vocal else 50,
                     minimum_frequency=65.0 if is_vocal else 32.0,
                     maximum_frequency=2000.0 if is_vocal else 4000.0,
                     melodia_trick=is_vocal,
@@ -1519,20 +1503,38 @@ class EarCopyEngine:
                 except Exception:
                     pass
 
-    # ---- ブレンド＆マスタリング ---------------------------
+    # ---- ハイブリッドミックス＆マスタリング ----------------
 
-    def _blend(self, synth_audio, orig_audio, sr, ratio):
-        """合成音と原曲をクロスブレンド (ratio=1.0 で原曲のみ)"""
-        n = max(len(synth_audio), len(orig_audio))
-        a = np.zeros(n, dtype=np.float32)
-        b = np.zeros(n, dtype=np.float32)
-        a[:len(synth_audio)] = synth_audio
-        b[:len(orig_audio)] = orig_audio
-        # RMS を揃える
-        rms_a = np.sqrt(np.mean(a**2) + 1e-9)
-        rms_b = np.sqrt(np.mean(b**2) + 1e-9)
-        b *= rms_a / rms_b
-        return (1 - ratio) * a + ratio * b
+    def _hybrid_mix(self, synth_audio, stems):
+        """合成音にドラム/ベース原音ステムをRMS正規化して加算する。
+
+        曲ごとの音量バランスを安定させるため、合成音のRMSを基準に
+        各ステムを目標レシオまで持ち上げる。
+        """
+        n = len(synth_audio)
+        out = np.zeros(n, dtype=np.float32)
+        out[:n] += synth_audio
+
+        rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
+
+        def _add_stem(stem, target_ratio):
+            if stem is None or len(stem) == 0 or rms_synth <= 1e-6:
+                return
+            seg = stem[:n] if len(stem) >= n else np.pad(stem, (0, n - len(stem)))
+            rms_stem = float(np.sqrt(np.mean(seg ** 2) + 1e-9))
+            if rms_stem <= 1e-6:
+                return
+            # 目標 RMS = 合成音 RMS * target_ratio
+            gain = (rms_synth * target_ratio) / rms_stem
+            # 過大ゲイン抑制（ピーク 0.95 を超えないよう制限）
+            peak = float(np.max(np.abs(seg)))
+            if peak * gain > 0.95:
+                gain = 0.95 / max(peak, 1e-6)
+            out[:n] += seg * gain
+
+        _add_stem(stems.get("drums"), target_ratio=0.85)
+        _add_stem(stems.get("bass"),  target_ratio=0.55)
+        return out
 
     def _master(self, audio):
         """マスタリング: HP/LP EQ → コンプレッサー → ソフトクリップ"""
@@ -1551,7 +1553,7 @@ class EarCopyEngine:
         # 簡易コンプレッサー（ブロック単位 RMS ベース）
         block = int(SR * 0.02)  # 20ms ブロック
         threshold = 0.3
-        ratio = 3.0
+        ratio = 2.5
         for i in range(0, len(audio) - block, block):
             chunk = audio[i:i + block]
             rms = np.sqrt(np.mean(chunk ** 2) + 1e-9)
@@ -2122,7 +2124,6 @@ class App:
         self._status   = tk.StringVar(value="MP3ファイルをドロップしてください")
         self._progress = tk.DoubleVar(value=0)
         self._mode     = tk.StringVar(value="ai")
-        self._blend    = tk.DoubleVar(value=0.0)
         self._busy     = False
 
         self._build()
@@ -2166,7 +2167,7 @@ class App:
         mf.pack(padx=30, pady=(14, 0), fill="x")
         modes = [
             ("ai",      "AI耳コピ (Demucs+BasicPitch) / 推奨"),
-            ("blend",   "原曲ブレンド (AI耳コピ + 原曲ミックス)"),
+            ("ai_inst", "AI耳コピ・ガイドメロディなし (カラオケ伴奏向け)"),
             ("karaoke", "カラオケ (ボーカル除去のみ / 最高忠実度)"),
             ("classic", "Classic (v6.0軽量 / AI不要)"),
         ]
@@ -2176,24 +2177,7 @@ class App:
                 bg=self.BG, fg=self.FG, selectcolor=self.BG2,
                 activebackground=self.BG, activeforeground=self.ACCENT,
                 font=("Helvetica", 9), anchor="w",
-                command=self._on_mode_change
             ).pack(anchor="w", padx=8, pady=1)
-
-        # ブレンド比率スライダー
-        self._blend_frame = tk.Frame(mf, bg=self.BG)
-        self._blend_frame.pack(fill="x", padx=10, pady=(3, 6))
-        tk.Label(self._blend_frame, text="原曲ブレンド比率:",
-                 bg=self.BG, fg=self.FG2, font=("Helvetica", 8)
-                 ).pack(side="left")
-        self._blend_scale = tk.Scale(
-            self._blend_frame, from_=0.0, to=1.0, resolution=0.05,
-            orient="horizontal", variable=self._blend,
-            bg=self.BG, fg=self.FG, troughcolor=self.BG2,
-            highlightthickness=0, length=280, showvalue=True,
-            activebackground=self.ACCENT
-        )
-        self._blend_scale.pack(side="left", padx=(6, 0))
-        self._blend_frame.pack_forget()  # ai モードでは非表示
 
         # 出力先
         of = tk.Frame(r, bg=self.BG)
@@ -2236,12 +2220,6 @@ class App:
 
     # ---- イベントハンドラ --------------------------------
 
-    def _on_mode_change(self):
-        if self._mode.get() == "blend":
-            self._blend_frame.pack(fill="x", padx=10, pady=(3, 6))
-        else:
-            self._blend_frame.pack_forget()
-
     def _hover(self, on):
         c = "#1e3a5f" if on else self.BG2
         self._drop_frame.configure(bg=c)
@@ -2283,12 +2261,9 @@ class App:
         self._append_log(f"出力: {output}")
 
         mode = self._mode.get()
-        blend = float(self._blend.get()) if mode == "blend" else 0.0
 
         def worker():
-            engine = EarCopyEngine(
-                on_progress=self._on_prog, mode=mode, blend_ratio=blend
-            )
+            engine = EarCopyEngine(on_progress=self._on_prog, mode=mode)
             ok, res = engine.process(path, output)
             self.root.after(0, lambda: (self._done(res) if ok else self._err(res)))
 
@@ -2349,10 +2324,9 @@ def _run_cli(args):
     )
     parser.add_argument("input", help="入力音楽ファイル（MP3/WAV/M4A/FLAC）")
     parser.add_argument("-o", "--output", help="出力MP3パス（省略時: 同じフォルダに 耳コピ_*.mp3）")
-    parser.add_argument("--mode", choices=["ai", "blend", "karaoke", "classic"],
-                        default="ai", help="処理モード (デフォルト: ai)")
-    parser.add_argument("--blend", type=float, default=0.0,
-                        help="blend モード時の原曲比率 0.0-1.0 (デフォルト: 0.0)")
+    parser.add_argument("--mode", choices=["ai", "ai_inst", "karaoke", "classic"],
+                        default="ai",
+                        help="処理モード: ai (推奨) / ai_inst (ガイドメロディなし) / karaoke / classic")
     opts = parser.parse_args(args)
 
     inp = Path(opts.input)
@@ -2370,7 +2344,7 @@ def _run_cli(args):
     print(f"モード: {opts.mode}")
     print()
 
-    engine = EarCopyEngine(mode=opts.mode, blend_ratio=opts.blend)
+    engine = EarCopyEngine(mode=opts.mode)
     ok, result = engine.process(str(inp), out)
 
     if ok:
