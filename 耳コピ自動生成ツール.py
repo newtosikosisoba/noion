@@ -1103,12 +1103,30 @@ class EarCopyEngine:
 
     def _basic_pitch_notes(self, audio, sr, is_vocal=False):
         """Basic Pitch で多声部採譜し [(t, dur, midi, vel), ...] を返す"""
+        # PATH に非実在ディレクトリが含まれていると Basic Pitch の依存ライブラリが
+        # インポート時に WinError 3 を投げる（例: C:\tools\fluidsynth\bin が未作成）
+        # 環境を汚染しないよう、一時的に存在するディレクトリだけに絞り込む
+        original_path = os.environ.get("PATH", "")
+        sep = os.pathsep
         try:
-            from basic_pitch.inference import predict
-            from basic_pitch import ICASSP_2022_MODEL_PATH
-        except Exception as e:
-            self._log(f"Basic Pitch インポート失敗、fallback: {e}", -1)
-            return self._fallback_transcribe(audio, sr, is_vocal)
+            clean_entries = [p for p in original_path.split(sep)
+                             if not p or Path(p).exists()]
+            os.environ["PATH"] = sep.join(clean_entries)
+        except Exception:
+            pass  # サニタイズ失敗は無視して元のPATHで続行
+
+        try:
+            try:
+                from basic_pitch.inference import predict
+                from basic_pitch import ICASSP_2022_MODEL_PATH
+            except Exception as e:
+                err_type = type(e).__name__
+                msg = str(e)[:150]
+                self._log(f"Basic Pitch 利用不可 ({err_type}): {msg}", -1)
+                self._log("  → CQT+pyin フォールバックで代替（精度は低下します）", -1)
+                return self._fallback_transcribe(audio, sr, is_vocal)
+        finally:
+            os.environ["PATH"] = original_path
 
         # Basic Pitch は 22050Hz を期待
         target_sr = 22050
