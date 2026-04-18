@@ -571,11 +571,11 @@ class EarCopyEngine:
         'trumpet': (13, 56), 'flute': (14, 73), 'pad': (15, 89),
     }
     GAIN = {
-        'piano': 1.0, 'e_piano': 0.7, 'glockenspiel': 0.5,
-        'organ': 0.5, 'guitar_nylon': 0.7, 'guitar_clean': 0.6,
-        'bass': 0.9, 'violin': 0.8, 'viola': 0.7, 'cello': 0.8,
-        'strings': 0.5, 'choir': 0.4, 'trumpet': 0.6,
-        'flute': 0.6, 'pad': 0.4,
+        'piano': 1.0, 'e_piano': 0.85, 'glockenspiel': 0.65,
+        'organ': 0.7, 'guitar_nylon': 0.85, 'guitar_clean': 0.8,
+        'bass': 0.95, 'violin': 0.9, 'viola': 0.85, 'cello': 0.9,
+        'strings': 0.75, 'choir': 0.6, 'trumpet': 0.8,
+        'flute': 0.75, 'pad': 0.55,
     }
     CHORD_IV = {
         'maj': [0,4,7], 'min': [0,3,7], 'dom7': [0,4,7,10],
@@ -933,7 +933,7 @@ class EarCopyEngine:
     # ============================================================
 
     def _process_ai(self, input_path: str, output_path: str):
-        """Demucs + Basic Pitch の主パイプライン"""
+        """Demucs + Basic Pitch の主パイプライン（ハイブリッド合成）"""
         self._log("AIモデル準備中...", 2)
         if not _ensure_ai_packages(lambda m: self._log(m, 3)):
             self._log("AIパッケージ取得に失敗、Classic モードへフォールバック", 5)
@@ -983,13 +983,34 @@ class EarCopyEngine:
         midi_path = str(Path(output_path).with_suffix(".mid"))
         self._save_midi(parts, drum_events, tempo, midi_path)
 
-        # 6. 音声合成: FluidSynth 優先、失敗時は加算合成
+        # 6. ハイブリッド合成: メロディ/ハーモニーは MIDI 合成、
+        #    ドラム・ベースは原音ステムを活用してカラオケ品質に近づける
         self._log("音声合成中...", 82)
-        audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
+        synth_audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
 
-        # 7. ブレンドモード / karaoke 合成
+        # ドラム・ベースの原音ステムをブレンド（品質大幅向上）
+        self._log("ハイブリッドミキシング中...", 88)
+        n = len(synth_audio)
+        hybrid = np.zeros(n, dtype=np.float32)
+        hybrid[:len(synth_audio)] += synth_audio
+
+        # 原音ドラムステムを加算（合成ドラムより圧倒的に高品質）
+        drums_orig = stems["drums"]
+        if len(drums_orig) > 0:
+            dn = min(len(drums_orig), n)
+            hybrid[:dn] += drums_orig[:dn] * 0.65
+
+        # 原音ベースステムを加算（pyin 単音検出の限界を補完）
+        bass_orig = stems["bass"]
+        if len(bass_orig) > 0:
+            bn = min(len(bass_orig), n)
+            hybrid[:bn] += bass_orig[:bn] * 0.40
+
+        audio = hybrid
+
+        # 7. ブレンドモード
         if self.mode == "blend" and self.blend_ratio > 0:
-            self._log(f"原曲と合成をブレンド中 (原曲 {self.blend_ratio*100:.0f}%)...", 88)
+            self._log(f"原曲と合成をブレンド中 (原曲 {self.blend_ratio*100:.0f}%)...", 90)
             mix = self._mix_stems(stems, include_vocals=False)
             audio = self._blend(audio, mix, sr, self.blend_ratio)
 
@@ -1293,23 +1314,18 @@ class EarCopyEngine:
 
         for (t, dur, midi, vel) in other_sorted:
             if midi >= 84:
-                # 超高音: グロッケン（控えめ）
-                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.45)))
+                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.7)))
             elif midi >= 72:
-                # 高音伴奏: エレピ（コード担当）
-                parts['e_piano'].append((t, dur, midi, int(vel * 0.65)))
+                parts['e_piano'].append((t, dur, midi, int(vel * 0.85)))
             elif midi >= 60:
-                # 中音伴奏: ギター or ストリングス
                 if dur >= 0.5:
-                    parts['strings'].append((t, dur, midi, int(vel * 0.55)))
+                    parts['strings'].append((t, dur, midi, int(vel * 0.8)))
                 else:
-                    parts['guitar_clean'].append((t, dur, midi, int(vel * 0.6)))
+                    parts['guitar_clean'].append((t, dur, midi, int(vel * 0.8)))
             elif midi >= 48:
-                # 低中音: ナイロンギター
-                parts['guitar_nylon'].append((t, dur, midi, int(vel * 0.55)))
+                parts['guitar_nylon'].append((t, dur, midi, int(vel * 0.75)))
             else:
-                # 超低音: チェロ
-                parts['cello'].append((t, dur, midi, int(vel * 0.6)))
+                parts['cello'].append((t, dur, midi, int(vel * 0.8)))
 
         # === 3. ベース → 専用パートのみ（ダブリングなし） ===
         for (t, dur, midi, vel) in bass_notes:
@@ -1319,14 +1335,14 @@ class EarCopyEngine:
         # (長い持続音が多い場合のみストリングスをパッドで補強)
         long_strings = [(t, dur, m, v) for t, dur, m, v in parts['strings'] if dur >= 1.0]
         for (t, dur, midi, vel) in long_strings:
-            parts['pad'].append((t, dur, midi, int(vel * 0.25)))
+            parts['pad'].append((t, dur, midi, int(vel * 0.35)))
 
         return parts
 
     # ---- ノート量子化・正規化 ----------------------------
 
     def _quantize_notes(self, notes, beat_times, tempo):
-        """ノートをビートグリッドにスナップし、重複ノートを統合する"""
+        """ノートをビートグリッドに軽くスナップし、重複ノートを統合する"""
         if not notes or beat_times is None or len(beat_times) < 2:
             return notes
 
@@ -1338,14 +1354,16 @@ class EarCopyEngine:
 
         quantized = []
         for (t, dur, midi, vel) in notes:
-            # 最寄りのグリッドにスナップ（最大 grid_step/2 まで）
             idx = np.argmin(np.abs(grid - t))
             qt = grid[idx]
-            if abs(qt - t) > grid_step * 0.6:
-                qt = t  # 遠すぎるならスナップしない
-            # durationも最寄りのグリッド倍数に丸め
-            qdur = max(round(dur / grid_step) * grid_step, grid_step)
-            qdur = min(qdur, dur * 1.5)
+            dist = abs(qt - t)
+            if dist > grid_step * 0.4:
+                qt = t  # グリッドから遠い→自然なタイミングを保持
+            elif dist > grid_step * 0.15:
+                qt = t + (qt - t) * 0.5  # 中距離→半分だけスナップ
+            # durationは元の長さを尊重（軽い丸めのみ）
+            qdur = max(round(dur / grid_step) * grid_step, grid_step * 0.5)
+            qdur = min(qdur, dur * 1.3)
             quantized.append((qt, qdur, midi, vel))
 
         # 同一時刻・同一ピッチの重複除去（loudest 優先）
@@ -1366,11 +1384,11 @@ class EarCopyEngine:
         """FluidSynth で合成、失敗時は v6 加算合成にフォールバック"""
         audio = self._synthesize_fluidsynth(midi_path, duration)
         if audio is not None:
-            return audio * 0.85
+            return audio * 0.90
         self._log("  FluidSynth 未使用、v6加算合成を使用", 84)
         n = int((duration + 2.0) * SR)
-        audio = self._synth_parts(parts, n) * 0.75
-        audio += self._synth_drums(drum_events, n) * 0.50
+        audio = self._synth_parts(parts, n) * 0.85
+        audio += self._synth_drums(drum_events, n) * 0.55
         return audio
 
     def _synthesize_fluidsynth(self, midi_path, duration):
@@ -1526,8 +1544,8 @@ class EarCopyEngine:
         b, a = butter(3, 35 / nyq, btype="high")
         audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # ローパス 16kHz (耳障りな超高域を抑制)
-        b, a = butter(2, min(16000 / nyq, 0.99), btype="low")
+        # ローパス 18kHz (超高域を自然に抑制)
+        b, a = butter(2, min(18000 / nyq, 0.99), btype="low")
         audio = filtfilt(b, a, audio).astype(np.float32)
 
         # 簡易コンプレッサー（ブロック単位 RMS ベース）
