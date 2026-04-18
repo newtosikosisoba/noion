@@ -1103,17 +1103,30 @@ class EarCopyEngine:
 
     def _basic_pitch_notes(self, audio, sr, is_vocal=False):
         """Basic Pitch で多声部採譜し [(t, dur, midi, vel), ...] を返す"""
-        # PATH に非実在ディレクトリが含まれていると Basic Pitch の依存ライブラリが
-        # インポート時に WinError 3 を投げる（例: C:\tools\fluidsynth\bin が未作成）
-        # 環境を汚染しないよう、一時的に存在するディレクトリだけに絞り込む
+        # Windows で非実在ディレクトリが PATH や DLL 検索パスに含まれていると
+        # Basic Pitch / pyfluidsynth 等の依存が import 時に WinError 3 を投げる。
+        # 対策: (1) PATH サニタイズ  (2) os.add_dll_directory のガード
         original_path = os.environ.get("PATH", "")
         sep = os.pathsep
+        _patched_add_dll = False
+        _orig_add_dll = None
         try:
-            clean_entries = [p for p in original_path.split(sep)
-                             if not p or Path(p).exists()]
-            os.environ["PATH"] = sep.join(clean_entries)
+            clean = [p for p in original_path.split(sep)
+                     if not p or Path(p).exists()]
+            os.environ["PATH"] = sep.join(clean)
         except Exception:
-            pass  # サニタイズ失敗は無視して元のPATHで続行
+            pass
+        if platform.system() == "Windows" and hasattr(os, "add_dll_directory"):
+            _orig_add_dll = os.add_dll_directory
+            def _safe_add_dll(path):
+                try:
+                    if Path(path).is_dir():
+                        return _orig_add_dll(path)
+                except OSError:
+                    pass
+                return None
+            os.add_dll_directory = _safe_add_dll
+            _patched_add_dll = True
 
         try:
             try:
@@ -1127,6 +1140,8 @@ class EarCopyEngine:
                 return self._fallback_transcribe(audio, sr, is_vocal)
         finally:
             os.environ["PATH"] = original_path
+            if _patched_add_dll and _orig_add_dll is not None:
+                os.add_dll_directory = _orig_add_dll
 
         # Basic Pitch は 22050Hz を期待
         target_sr = 22050
