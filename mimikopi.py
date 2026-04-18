@@ -954,6 +954,10 @@ class EarCopyEngine:
         tempo, beats = self._tempo(y, sr)
         self._log(f"テンポ: {tempo:.1f} BPM", 28)
 
+        scale_set, scale_name = self._estimate_key(y, sr)
+        if scale_set is not None:
+            self._log(f"  推定キー: {scale_name}", 30)
+
         skip_vocal = (self.mode == "ai_inst")
         if skip_vocal:
             self._log("ガイドメロディなしモード: ボーカル採譜をスキップ", 32)
@@ -962,6 +966,8 @@ class EarCopyEngine:
             self._log("ボーカルを多声部採譜中 (Basic Pitch)...", 32)
             vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
             self._log(f"  ボーカル: {len(vocal_notes)} 音符", 45)
+            if scale_set is not None:
+                vocal_notes = self._scale_snap_notes(vocal_notes, scale_set)
 
         self._log("その他楽器を多声部採譜中 (Basic Pitch)...", 50)
         other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
@@ -1270,7 +1276,9 @@ class EarCopyEngine:
                 kind = "ride"
             else:
                 kind = "snare"
-            events.append((ot, kind))
+            peak = float(np.max(np.abs(seg))) if len(seg) else 0.0
+            vel = int(np.clip(60 + peak * 120, 40, 127))
+            events.append((ot, kind, vel))
         return events
 
     # ---- AI 検出結果 → 15楽器割り当て ----------------------
@@ -1362,12 +1370,78 @@ class EarCopyEngine:
                 seen[key] = (t, dur, midi, vel)
         return sorted(seen.values(), key=lambda x: x[0])
 
+    def _estimate_key(self, audio, sr):
+        """Krumhansl–Schmuckler キー推定。
+        戻り値: (scale_set: set[int 0-11], scale_name: str)
+        失敗時は (None, "unknown")。
+        """
+        try:
+            chroma = librosa.feature.chroma_cqt(y=audio, sr=sr, hop_length=HOP)
+            chroma_mean = np.mean(chroma, axis=1)
+            if np.sum(chroma_mean) < 1e-6:
+                return None, "unknown"
+            major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+                               2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+            minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+                               2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+            pitch_names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+            best_score = -1e9
+            best_root = 0
+            best_mode = 'major'
+            for root in range(12):
+                for mode_name, prof in (('major', major), ('minor', minor)):
+                    rotated = np.roll(prof, root)
+                    score = float(np.corrcoef(chroma_mean, rotated)[0, 1])
+                    if score > best_score:
+                        best_score = score
+                        best_root = root
+                        best_mode = mode_name
+            if best_mode == 'major':
+                degrees = [0, 2, 4, 5, 7, 9, 11]
+            else:
+                degrees = [0, 2, 3, 5, 7, 8, 10]
+            scale_set = {(best_root + d) % 12 for d in degrees}
+            scale_name = f"{pitch_names[best_root]} {best_mode}"
+            return scale_set, scale_name
+        except Exception:
+            return None, "unknown"
+
+    def _scale_snap_notes(self, notes, scale_set):
+        """スケール外ノートを隣接スケール音へ弱スナップ（±1半音のみ）。"""
+        if not notes or not scale_set:
+            return notes
+        snapped = []
+        for (t, dur, midi, vel) in notes:
+            pc = int(midi) % 12
+            if pc in scale_set:
+                snapped.append((t, dur, midi, vel))
+                continue
+            up_in = ((pc + 1) % 12) in scale_set
+            down_in = ((pc - 1) % 12) in scale_set
+            if down_in and not up_in:
+                snapped.append((t, dur, midi - 1, vel))
+            elif up_in and not down_in:
+                snapped.append((t, dur, midi + 1, vel))
+            elif up_in and down_in:
+                # 両隣ともスケール内 → 下へ（短調っぽさを残す）
+                snapped.append((t, dur, midi - 1, vel))
+            else:
+                snapped.append((t, dur, midi, vel))
+        return snapped
+
     # ---- 合成 (FluidSynth 優先) ---------------------------
 
     def _synthesize_audio(self, midi_path, parts, drum_events, duration):
         """FluidSynth で合成、失敗時は v6 加算合成にフォールバック"""
         audio = self._synthesize_fluidsynth(midi_path, duration)
         if audio is not None:
+            try:
+                from scipy.signal import iirpeak
+                b, a = iirpeak(2500 / (SR / 2), Q=1.0)
+                boosted = filtfilt(b, a, audio).astype(np.float32)
+                audio = (audio * 0.80 + boosted * 0.20).astype(np.float32)
+            except Exception:
+                pass
             return audio * 0.90
         self._log("  FluidSynth 未使用、v6加算合成を使用", 84)
         n = int((duration + 2.0) * SR)
@@ -1517,10 +1591,18 @@ class EarCopyEngine:
 
         rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
 
-        def _add_stem(stem, target_ratio):
+        def _add_stem(stem, target_ratio, kind=None):
             if stem is None or len(stem) == 0 or rms_synth <= 1e-6:
                 return
             seg = stem[:n] if len(stem) >= n else np.pad(stem, (0, n - len(stem)))
+            # 帯域フィルタ適用（RMS計測前）
+            nyq = SR / 2
+            if kind == "drums":
+                b, a = butter(2, 80 / nyq, btype="high")
+                seg = filtfilt(b, a, seg).astype(np.float32)
+            elif kind == "bass":
+                b, a = butter(2, 300 / nyq, btype="low")
+                seg = filtfilt(b, a, seg).astype(np.float32)
             rms_stem = float(np.sqrt(np.mean(seg ** 2) + 1e-9))
             if rms_stem <= 1e-6:
                 return
@@ -1532,8 +1614,8 @@ class EarCopyEngine:
                 gain = 0.95 / max(peak, 1e-6)
             out[:n] += seg * gain
 
-        _add_stem(stems.get("drums"), target_ratio=0.85)
-        _add_stem(stems.get("bass"),  target_ratio=0.55)
+        _add_stem(stems.get("drums"), target_ratio=0.85, kind="drums")
+        _add_stem(stems.get("bass"),  target_ratio=0.50, kind="bass")
         return out
 
     def _master(self, audio):
@@ -1933,9 +2015,14 @@ class EarCopyEngine:
 
     def _synth_drums(self, events, n):
         buf = np.zeros(n)
-        for (onset, kind) in events:
+        for evt in events:
+            onset = evt[0]
+            kind = evt[1]
+            vel = evt[2] if len(evt) > 2 else None
             s0 = int(onset * SR)
             snd = self._drum_sound(kind)
+            if vel is not None:
+                snd = snd * (vel / 100.0)
             s1 = s0 + len(snd)
             if s1 <= n:
                 buf[s0:s1] += snd
@@ -2076,10 +2163,14 @@ class EarCopyEngine:
         devs.append((0, Message('control_change', channel=9, control=7, value=105, time=0)))  # Vol
         devs.append((0, Message('control_change', channel=9, control=10, value=64, time=0)))  # Pan center
         devs.append((0, Message('control_change', channel=9, control=91, value=30, time=0)))  # Reverb
-        for (t, kind) in drums:
+        for evt in drums:
+            t = evt[0]
+            kind = evt[1]
+            if len(evt) > 2:
+                dv = int(np.clip(evt[2], 1, 127))
+            else:
+                dv = {'kick': 105, 'snare': 100, 'hihat': 75, 'ride': 70}.get(kind, 90)
             n = DM.get(kind, 38)
-            # ドラムのベロシティも種類で変える
-            dv = {'kick': 105, 'snare': 100, 'hihat': 75, 'ride': 70}.get(kind, 90)
             t0 = s2t(t)
             devs.append((t0, Message('note_on', channel=9, note=n, velocity=dv, time=0)))
             devs.append((t0 + 30, Message('note_off', channel=9, note=n, velocity=0, time=0)))
