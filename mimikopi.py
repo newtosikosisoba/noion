@@ -292,9 +292,26 @@ _FFMPEG_OK = _setup_ffmpeg()
 _SF2_CONFIG = Path(__file__).parent / ".sf2_path.json"
 _ASSETS_DIR = Path(__file__).parent / "_assets"
 
-# 無料で商用可な汎用GM SoundFont（失敗時の候補を複数用意）
 _SF2_DOWNLOADS = [
     # (表示名, URL, 想定サイズMB, 拡張子)
+    # 第1優先: GeneralUser GS v1.471 (高品質、コンパクト、商用可)
+    ("GeneralUser GS v1.471 (GitHub/ROCKNIX)",
+     "https://github.com/ROCKNIX/generaluser-gs/raw/main/GeneralUser%20GS%20v1.471.sf2",
+     30, "sf2"),
+    ("GeneralUser GS v1.471 (GitHub/JELOS)",
+     "https://github.com/JustEnoughLinuxOS/generaluser-gs/raw/main/GeneralUser%20GS%20v1.471.sf2",
+     30, "sf2"),
+    ("GeneralUser GS v1.471 (Musical Artifacts)",
+     "https://musical-artifacts.com/artifacts/1390/GeneralUser_GS_v1.471.sf2",
+     30, "sf2"),
+    # 第2優先: MuseScore / MS Basic SF3 (公式OSS、多サンプル)
+    ("MuseScore General SF3",
+     "https://ftp.osuosl.org/pub/musescore/soundfont/MuseScore_General/MuseScore_General.sf3",
+     38, "sf3"),
+    ("MS Basic SF3 (MuseScore GitHub)",
+     "https://github.com/musescore/MuseScore/raw/master/share/sound/MS%20Basic.sf3",
+     38, "sf3"),
+    # 第3優先: FluidR3_GM (現行、フォールバック)
     ("FluidR3_GM (SourceForge)",
      "https://sourceforge.net/projects/pianobooster/files/pianobooster/1.0.0/FluidR3_GM.sf2/download",
      140, "sf2"),
@@ -306,9 +323,44 @@ _SF2_DOWNLOADS = [
      140, "sf2"),
 ]
 
+_SF2_QUALITY_KEYWORDS = [
+    ("generaluser",     100),
+    ("musescore_gen",    95),
+    ("ms basic",         93),
+    ("ms_basic",         93),
+    ("sgm",              90),
+    ("timbres",          88),
+    ("compifont",        85),
+    ("fluidr3",          70),
+    ("default",          30),
+]
+
+
+def _sf2_quality_score(path: str) -> int:
+    name = Path(path).name.lower()
+    base_score = 0
+    for kw, score in _SF2_QUALITY_KEYWORDS:
+        if kw in name:
+            base_score = max(base_score, score)
+    try:
+        size_mb = Path(path).stat().st_size / (1024 * 1024)
+        if size_mb >= 200:
+            base_score += 15
+        elif size_mb >= 100:
+            base_score += 10
+        elif size_mb >= 30:
+            base_score += 5
+    except Exception:
+        pass
+    return base_score
+
 
 def _find_sf2():
     """SoundFont (.sf2/.sf3) のパスを解決する"""
+    # 0. 環境変数で明示指定された場合は最優先
+    env_sf2 = os.environ.get("MIMIKOPI_SF2", "").strip()
+    if env_sf2 and Path(env_sf2).exists():
+        return env_sf2
     # 1. 前回保存したパス
     if _SF2_CONFIG.exists():
         try:
@@ -319,11 +371,14 @@ def _find_sf2():
         except Exception:
             pass
 
-    # 2. アセットディレクトリを検索
+    # 2. アセットディレクトリを検索（品質スコア最高のものを選択）
     if _ASSETS_DIR.exists():
+        local_fonts = []
         for ext in ("*.sf2", "*.sf3"):
-            for p in _ASSETS_DIR.glob(ext):
-                return str(p)
+            local_fonts.extend(_ASSETS_DIR.glob(ext))
+        if local_fonts:
+            best = max(local_fonts, key=lambda p: _sf2_quality_score(str(p)))
+            return str(best)
 
     # 3. よくあるシステム設置場所
     candidates = []
@@ -345,10 +400,11 @@ def _find_sf2():
             "/usr/share/soundfonts/default.sf2",
             "/usr/share/soundfonts/FluidR3_GM.sf2",
         ]
-    for c in candidates:
-        if Path(c).exists():
-            _save_sf2(c)
-            return c
+    found = [c for c in candidates if Path(c).exists()]
+    if found:
+        best = max(found, key=lambda c: _sf2_quality_score(c))
+        _save_sf2(best)
+        return best
     return None
 
 
@@ -402,13 +458,16 @@ def _download_sf2(log=print):
                 log(f"  ✗ {name}: ZIPにSF2が含まれず")
                 continue
 
-            # SF2ヘッダ検証 (RIFF...sfbk)
-            if len(data) > 16 and (data[:4] == b"RIFF" and b"sfbk" in data[:64]):
+            # SF2/SF3 ヘッダ検証 (RIFF...sfbk)
+            is_valid_sf = (len(data) > 16
+                           and data[:4] == b"RIFF"
+                           and b"sfbk" in data[:64])
+            if is_valid_sf:
                 _save_sf2(str(dest))
                 log(f"  ✓ {dest.name}")
                 return str(dest)
             dest.unlink(missing_ok=True)
-            log(f"  ✗ {name}: SF2フォーマット不正")
+            log(f"  ✗ {name}: SoundFontフォーマット不正")
         except Exception as e:
             log(f"  ✗ {name} 取得失敗: {e}")
             continue
@@ -1512,7 +1571,14 @@ class EarCopyEngine:
         if sf2 is None:
             self._log("  SoundFont が見つかりません", 84)
             return None
-        self._log(f"  SoundFont: {Path(sf2).name}", 84)
+        sf2_name = Path(sf2).name
+        try:
+            sf2_size_mb = Path(sf2).stat().st_size / (1024 * 1024)
+            _score = _sf2_quality_score(sf2)
+            _qlabel = "高品質" if _score >= 90 else "標準" if _score >= 60 else "簡易"
+            self._log(f"  SoundFont: {sf2_name} ({sf2_size_mb:.0f}MB, {_qlabel})", 84)
+        except Exception:
+            self._log(f"  SoundFont: {sf2_name}", 84)
 
         # 2. FluidSynth CLI バイナリを確保
         fs_bin = _ensure_fluidsynth_cli(lambda m: self._log(m, 84))
