@@ -1538,18 +1538,18 @@ class EarCopyEngine:
 
         for (t, dur, midi, vel) in other_sorted:
             if midi >= 84:
-                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.7)))
+                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.85)))
             elif midi >= 72:
-                parts['e_piano'].append((t, dur, midi, int(vel * 0.85)))
+                parts['e_piano'].append((t, dur, midi, vel))
             elif midi >= 60:
                 if dur >= 0.5:
-                    parts['strings'].append((t, dur, midi, int(vel * 0.8)))
+                    parts['strings'].append((t, dur, midi, vel))
                 else:
-                    parts['guitar_clean'].append((t, dur, midi, int(vel * 0.8)))
+                    parts['guitar_clean'].append((t, dur, midi, vel))
             elif midi >= 48:
-                parts['guitar_nylon'].append((t, dur, midi, int(vel * 0.75)))
+                parts['guitar_nylon'].append((t, dur, midi, vel))
             else:
-                parts['cello'].append((t, dur, midi, int(vel * 0.8)))
+                parts['cello'].append((t, dur, midi, vel))
 
         # === 3. ベース → 専用パートのみ（ダブリングなし） ===
         for (t, dur, midi, vel) in bass_notes:
@@ -1619,16 +1619,30 @@ class EarCopyEngine:
         return sorted(seen.values(), key=lambda x: x[0])
 
     def _normalize_velocity(self, notes, target_min=45, target_max=115):
-        """ベロシティを target_min–target_max にスケーリング"""
+        """ベロシティをソフト正規化。パーセンタイルベースで極端値を無視、
+        中央のダイナミクスは保持する（線形スケールより表現を残す）。"""
         if not notes:
             return notes
-        vels = [v for _, _, _, v in notes]
-        v_min, v_max = min(vels), max(vels)
-        if v_max - v_min < 5:
+        vels = np.array([v for _, _, _, v in notes], dtype=np.float32)
+        if vels.size < 3 or float(vels.max() - vels.min()) < 5:
             return notes
-        scale = (target_max - target_min) / (v_max - v_min)
-        return [(t, dur, m, int(np.clip(target_min + (v - v_min) * scale, 1, 127)))
-                for t, dur, m, v in notes]
+        # 5%/95% パーセンタイルを基準に線形マッピング（外れ値の影響を抑える）
+        v_low = float(np.percentile(vels, 5))
+        v_high = float(np.percentile(vels, 95))
+        if v_high - v_low < 5:
+            return notes
+        center = (target_min + target_max) / 2.0
+        span = (target_max - target_min) / 2.0
+        # ソフト係数: 0.7 = 30%は元の表現を保持
+        blend = 0.7
+        scaled = []
+        for (t, dur, m, v) in notes:
+            norm = (float(v) - v_low) / (v_high - v_low)
+            norm = max(0.0, min(1.0, norm))
+            target = target_min + norm * (target_max - target_min)
+            mixed = blend * target + (1.0 - blend) * float(v)
+            scaled.append((t, dur, m, int(np.clip(mixed, 1, 127))))
+        return scaled
 
     def _estimate_key(self, audio, sr):
         """Krumhansl–Schmuckler キー推定。
@@ -1667,12 +1681,17 @@ class EarCopyEngine:
             return None, "unknown"
 
     def _scale_snap_notes(self, notes, scale_set):
-        """スケール外ノートを隣接スケール音へ弱スナップ（±1半音のみ）。"""
+        """スケール外ノートを隣接スケール音へ弱スナップ（±1半音のみ）。
+        短いノート（経過音・装飾音の可能性）はスナップせず元の個性を保持する。"""
         if not notes or not scale_set:
             return notes
         snapped = []
         for (t, dur, midi, vel) in notes:
             pc = int(midi) % 12
+            # 持続時間が短い（0.2秒未満）ノートは経過音として尊重
+            if dur < 0.2:
+                snapped.append((t, dur, midi, vel))
+                continue
             if pc in scale_set:
                 snapped.append((t, dur, midi, vel))
                 continue
@@ -1889,6 +1908,14 @@ class EarCopyEngine:
             peak = float(np.max(np.abs(seg)))
             if peak * gain > 0.95:
                 gain = 0.95 / max(peak, 1e-6)
+            # ステム境界のクリック防止: raised-cosine フェード (30ms)
+            fade_len = min(int(0.03 * SR), len(seg) // 4)
+            if fade_len > 0:
+                fade_in = 0.5 * (1 - np.cos(np.linspace(0, np.pi, fade_len))).astype(np.float32)
+                fade_out = fade_in[::-1]
+                seg = seg.copy()
+                seg[:fade_len] *= fade_in
+                seg[-fade_len:] *= fade_out
             if is_stereo:
                 out[:n] += np.column_stack([seg * gain, seg * gain])
             else:
@@ -1910,6 +1937,18 @@ class EarCopyEngine:
 
         # DC オフセット除去
         audio = (audio - np.mean(audio, axis=0)).astype(np.float32)
+
+        # 軽いルームリバーブで空間感を統一（合成音と原ステムを馴染ませる）
+        try:
+            if is_stereo:
+                for ch in range(audio.shape[1]):
+                    audio[:, ch] = self._reverb_signal(
+                        audio[:, ch], room_size=0.35, wet=0.06
+                    )
+            else:
+                audio = self._reverb_signal(audio, room_size=0.35, wet=0.06)
+        except Exception:
+            pass
 
         nyq = SR / 2
 
@@ -1955,11 +1994,12 @@ class EarCopyEngine:
         else:
             audio *= gain_arr
 
-        # ノーマライズ + ソフトクリップ
+        # ノーマライズ + ソフトクリップ (歪み軽減のため控えめに)
         peak = np.max(np.abs(audio))
         if peak > 0:
-            audio = audio / peak * 0.95
-        audio = np.tanh(audio * 1.05) * 0.93
+            audio = audio / peak * 0.92
+        # 緩やかなtanh: ピーク 0.92 → tanh(0.92*0.85)*0.98 ≈ 0.63 → 自然なサチュレーション
+        audio = np.tanh(audio * 0.85) * 0.98
         return audio.astype(np.float32)
 
     def _validate_output(self, audio, duration):
