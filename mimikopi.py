@@ -219,7 +219,15 @@ def _find_ffmpeg():
         except Exception:
             pass
 
-    # 3. よくある場所を自動検索（Windows）
+    # 3. アセットディレクトリを検索
+    if _ASSETS_DIR.exists():
+        exe = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+        for p in _ASSETS_DIR.rglob(exe):
+            if p.is_file():
+                _save_ffmpeg(str(p))
+                return str(p)
+
+    # 4. よくある場所を自動検索（Windows）
     candidates = []
     if platform.system() == "Windows":
         for drive in ["C:", "D:"]:
@@ -233,7 +241,12 @@ def _find_ffmpeg():
                 _save_ffmpeg(c)
                 return c
 
-    # 4. ユーザーに手動選択させる（GUIダイアログ）
+    # 5. 自動ダウンロード・インストール
+    auto = _download_ffmpeg()
+    if auto:
+        return auto
+
+    # 6. ユーザーに手動選択させる（GUIダイアログ）
     try:
         import tkinter as _tk
         from tkinter import filedialog as _fd, messagebox as _mb
@@ -265,6 +278,112 @@ def _save_ffmpeg(path):
         _FFMPEG_CONFIG.write_text(json.dumps({"path": str(path)}))
     except Exception:
         pass
+
+
+def _download_ffmpeg(log=print):
+    """ffmpeg を自動ダウンロード・インストールする"""
+    system = platform.system()
+    _ASSETS_DIR.mkdir(exist_ok=True)
+    import urllib.request
+
+    if system == "Windows":
+        urls = [
+            ("FFmpeg (BtbN/GitHub)",
+             "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"),
+        ]
+        for name, url in urls:
+            log(f"  ffmpeg をダウンロード中 ({name})...")
+            try:
+                import zipfile
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (EarCopyTool)"})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    data = r.read()
+                if len(data) < 1_000_000:
+                    raise RuntimeError(f"ファイルサイズが小さすぎます ({len(data)} bytes)")
+                dest_zip = _ASSETS_DIR / "ffmpeg.zip"
+                dest_zip.write_bytes(data)
+                with zipfile.ZipFile(dest_zip) as zf:
+                    zf.extractall(_ASSETS_DIR)
+                dest_zip.unlink(missing_ok=True)
+                for p in _ASSETS_DIR.rglob("ffmpeg.exe"):
+                    if p.is_file():
+                        _save_ffmpeg(str(p))
+                        log(f"  ✓ ffmpeg: {p}")
+                        return str(p)
+                log(f"  ✗ {name}: ZIPにffmpegが含まれず")
+            except Exception as e:
+                log(f"  ✗ {name} 取得失敗: {e}")
+        return None
+
+    if system == "Linux":
+        for mgr_cmd in [["apt-get", "install", "-y", "ffmpeg"], ["apt", "install", "-y", "ffmpeg"],
+                         ["dnf", "install", "-y", "ffmpeg"], ["pacman", "-S", "--noconfirm", "ffmpeg"]]:
+            mgr = mgr_cmd[0]
+            if not shutil.which(mgr):
+                continue
+            log(f"  ffmpeg をインストール中 ({mgr})...")
+            try:
+                subprocess.check_call(mgr_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                ff = shutil.which("ffmpeg")
+                if ff:
+                    log(f"  ✓ ffmpeg: {ff}")
+                    return ff
+            except (subprocess.CalledProcessError, PermissionError):
+                try:
+                    subprocess.check_call(["sudo"] + mgr_cmd, timeout=120)
+                    ff = shutil.which("ffmpeg")
+                    if ff:
+                        log(f"  ✓ ffmpeg: {ff}")
+                        return ff
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        urls = [
+            ("FFmpeg (johnvansickle)",
+             "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"),
+        ]
+        for name, url in urls:
+            log(f"  ffmpeg をダウンロード中 ({name})...")
+            try:
+                import tarfile
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (EarCopyTool)"})
+                with urllib.request.urlopen(req, timeout=180) as r:
+                    data = r.read()
+                if len(data) < 1_000_000:
+                    raise RuntimeError(f"ファイルサイズが小さすぎます ({len(data)} bytes)")
+                dest_tar = _ASSETS_DIR / "ffmpeg.tar.xz"
+                dest_tar.write_bytes(data)
+                with tarfile.open(dest_tar) as tf:
+                    tf.extractall(_ASSETS_DIR)
+                dest_tar.unlink(missing_ok=True)
+                for p in _ASSETS_DIR.rglob("ffmpeg"):
+                    if p.is_file() and not p.suffix:
+                        p.chmod(0o755)
+                        _save_ffmpeg(str(p))
+                        log(f"  ✓ ffmpeg: {p}")
+                        return str(p)
+                log(f"  ✗ {name}: アーカイブにffmpegが含まれず")
+            except Exception as e:
+                log(f"  ✗ {name} 取得失敗: {e}")
+        return None
+
+    if system == "Darwin":
+        if shutil.which("brew"):
+            log("  ffmpeg をインストール中 (Homebrew)...")
+            try:
+                subprocess.check_call(["brew", "install", "ffmpeg"], timeout=300)
+                ff = shutil.which("ffmpeg")
+                if ff:
+                    log(f"  ✓ ffmpeg: {ff}")
+                    return ff
+            except Exception as e:
+                log(f"  ✗ Homebrew install 失敗: {e}")
+        log("  ffmpeg が見つかりません。以下を実行してください:")
+        log("    brew install ffmpeg")
+        return None
+
+    return None
 
 
 def _setup_ffmpeg():
@@ -559,9 +678,50 @@ def _download_fluidsynth(log=print):
     """Windows 用 FluidSynth バイナリを GitHub からダウンロードする"""
     system = platform.system()
     if system not in _FLUIDSYNTH_DL:
-        log(f"  FluidSynth: {system} は自動DL非対応（手動インストールが必要）")
+        if system == "Linux":
+            for mgr_cmd in [["apt-get", "install", "-y", "fluidsynth"],
+                             ["apt", "install", "-y", "fluidsynth"],
+                             ["dnf", "install", "-y", "fluidsynth"],
+                             ["pacman", "-S", "--noconfirm", "fluidsynth"]]:
+                mgr = mgr_cmd[0]
+                if not shutil.which(mgr):
+                    continue
+                log(f"  FluidSynth をインストール中 ({mgr})...")
+                try:
+                    subprocess.check_call(mgr_cmd, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL, timeout=120)
+                    fs = shutil.which("fluidsynth")
+                    if fs:
+                        _save_fluidsynth_path(fs)
+                        log(f"  ✓ FluidSynth: {fs}")
+                        return fs
+                except (subprocess.CalledProcessError, PermissionError):
+                    try:
+                        subprocess.check_call(["sudo"] + mgr_cmd, timeout=120)
+                        fs = shutil.which("fluidsynth")
+                        if fs:
+                            _save_fluidsynth_path(fs)
+                            log(f"  ✓ FluidSynth: {fs}")
+                            return fs
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        elif system == "Darwin":
+            if shutil.which("brew"):
+                log("  FluidSynth をインストール中 (Homebrew)...")
+                try:
+                    subprocess.check_call(["brew", "install", "fluid-synth"], timeout=300)
+                    fs = shutil.which("fluidsynth")
+                    if fs:
+                        _save_fluidsynth_path(fs)
+                        log(f"  ✓ FluidSynth: {fs}")
+                        return fs
+                except Exception as e:
+                    log(f"  ✗ Homebrew install 失敗: {e}")
+        log(f"  FluidSynth: {system} で自動インストールに失敗")
         if system == "Darwin":
-            log("    → brew install fluidsynth")
+            log("    → brew install fluid-synth")
         else:
             log("    → sudo apt install fluidsynth")
         return None
