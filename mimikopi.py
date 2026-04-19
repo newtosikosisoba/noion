@@ -1103,6 +1103,7 @@ class EarCopyEngine:
             duration = len(y) / sr
             y_h, y_p = self._hpss(y)
             tempo, beats = self._tempo(y, sr)
+            self._current_tempo = float(tempo) if tempo else 120.0
             self._log(f"テンポ: {tempo:.1f} BPM", 20)
 
             # 4層検出
@@ -1173,6 +1174,7 @@ class EarCopyEngine:
 
         # 3. 各ステムから採譜
         tempo, beats = self._tempo(y, sr)
+        self._current_tempo = float(tempo) if tempo else 120.0
         self._log(f"テンポ: {tempo:.1f} BPM", 28)
 
         scale_set, scale_name = self._estimate_key(y, sr)
@@ -1266,6 +1268,7 @@ class EarCopyEngine:
 
         # MIDI も参考用に出力
         tempo, _ = self._tempo(y, sr)
+        self._current_tempo = float(tempo) if tempo else 120.0
         self._log("参考 MIDI を作成中...", 85)
         bass_notes = self._pyin_bass_notes(stems["bass"], sr)
         other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
@@ -1570,11 +1573,21 @@ class EarCopyEngine:
             evts = sorted(parts[name], key=lambda x: x[0])
             filtered = []
             for note in evts:
-                t, dur = note[0], note[1]
-                active = sum(1 for ft, fd, _, _ in filtered
-                             if ft + fd > t and ft <= t)
-                if active < limit:
+                t, dur, _, vel = note
+                # 現在アクティブなノートのインデックスと velocity を集める
+                active_idx = [i for i, (ft, fd, _, _) in enumerate(filtered)
+                              if ft + fd > t and ft <= t]
+                if len(active_idx) < limit:
                     filtered.append(note)
+                else:
+                    # 最小 velocity のアクティブノートを見つけ、今のノートの方が大きければ置換
+                    min_i = min(active_idx, key=lambda i: filtered[i][3])
+                    if vel > filtered[min_i][3]:
+                        # 既存の最弱ノートを切る（現時刻まで短縮）→ 新ノートを追加
+                        ft, fd, fm, fv = filtered[min_i]
+                        new_dur = max(0.01, t - ft)
+                        filtered[min_i] = (ft, new_dur, fm, fv)
+                        filtered.append(note)
             parts[name] = filtered
 
         return parts
@@ -1766,8 +1779,7 @@ class EarCopyEngine:
             return None
 
         # 3. Windows 日本語パス問題回避: ASCIIのみの一時フォルダで作業
-        work_dir = Path(tempfile.gettempdir()) / "earcopy_fs"
-        work_dir.mkdir(exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="earcopy_fs_"))
         ascii_midi = work_dir / "in.mid"
         ascii_wav = work_dir / "out.wav"
         ascii_sf2 = work_dir / "font.sf2"
@@ -1872,6 +1884,7 @@ class EarCopyEngine:
                         p.unlink()
                 except Exception:
                     pass
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     # ---- ハイブリッドミックス＆マスタリング ----------------
 
@@ -1976,7 +1989,7 @@ class EarCopyEngine:
         env = 0.0
         n_samples = len(audio)
         gain_arr = np.ones(n_samples, dtype=np.float32)
-        block = 64
+        block = 32
         for i in range(0, n_samples - block, block):
             chunk = audio[i:i + block]
             peak = float(np.max(np.abs(chunk)))
@@ -1989,6 +2002,9 @@ class EarCopyEngine:
             else:
                 desired_gain = 1.0
             gain_arr[i:i + block] = desired_gain
+        # メイクアップゲイン: 圧縮で失った音量を補償（3dB 程度）
+        makeup = 10 ** (3.0 / 20.0)  # +3dB
+        gain_arr *= makeup
         if is_stereo:
             audio *= gain_arr[:, np.newaxis]
         else:
@@ -2427,15 +2443,18 @@ class EarCopyEngine:
         return buf
 
     def _drum_sound(self, kind):
+        # テンポに応じてドラムの持続時間を調整（速い曲は短く、遅い曲は長く）
+        tempo = getattr(self, '_current_tempo', 120.0)
+        scale = max(0.5, min(1.5, 120.0 / max(tempo, 60.0)))
         if kind == 'kick':
-            t = self._t(0.35)
+            t = self._t(0.35 * scale)
             sweep = 80 * np.exp(-t * 20) + 45
             sig = np.sin(2 * np.pi * np.cumsum(sweep) / SR) * np.exp(-t * 8)
             sub = np.sin(2 * np.pi * 50 * t) * np.exp(-t * 12)
             click = np.random.randn(len(t)) * np.exp(-t * 60) * 0.15
             return (sig * 0.7 + sub * 0.25 + click) * 0.75
         elif kind == 'snare':
-            t = self._t(0.2)
+            t = self._t(0.2 * scale)
             body = np.sin(2 * np.pi * 185 * t) * np.exp(-t * 20)
             body += np.sin(2 * np.pi * 330 * t) * np.exp(-t * 25) * 0.4
             noise = np.random.randn(len(t)) * np.exp(-t * 16)
@@ -2443,19 +2462,19 @@ class EarCopyEngine:
             noise = filtfilt(b, a, noise)
             return (body * 0.45 + noise * 0.55) * 0.6
         elif kind == 'ride':
-            t = self._t(0.5)
+            t = self._t(0.5 * scale)
             n_ = np.random.randn(len(t))
             b, a = butter(3, min(3500 / (SR / 2), 0.99), btype='high')
             sig = filtfilt(b, a, n_) * np.exp(-t * 5)
             bell = np.sin(2 * np.pi * 2800 * t) * np.exp(-t * 8) * 0.15
             return (sig + bell) * 0.22
         elif kind == 'hihat':
-            t = self._t(0.06)
+            t = self._t(0.06 * scale)
             n_ = np.random.randn(len(t))
             b, a = butter(3, min(6000 / (SR / 2), 0.99), btype='high')
             return filtfilt(b, a, n_) * np.exp(-t * 70) * 0.35
         else:
-            t = self._t(0.12)
+            t = self._t(0.12 * scale)
             n_ = np.random.randn(len(t))
             b, a = butter(3, min(5000 / (SR / 2), 0.99), btype='high')
             return filtfilt(b, a, n_) * np.exp(-t * 30) * 0.3
