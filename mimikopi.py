@@ -856,7 +856,7 @@ class EarCopyEngine:
             frame = C_sm[:, fi]
             # 適応閾値: フレーム内の最大値から相対的に決定
             frame_max = np.max(frame)
-            thr = max(frame_max - 22, 3.0)  # 最大値から22dB以内 + 最低3dB超え
+            thr = max(frame_max - 18, 1.5)  # 最大値から18dB以内 + 最低1.5dB超え（感度向上）
 
             on_now = set()
             peaks = []
@@ -895,13 +895,13 @@ class EarCopyEngine:
                 if mn not in on_now:
                     sf_, mx, has_onset = active.pop(mn)
                     dur = times[min(fi, len(times)-1)] - times[sf_]
-                    if dur >= 0.06:
+                    if dur >= 0.04:
                         vel = int(np.clip(mx * 3.5 + 30, 35, 127))
                         events.append((times[sf_], dur, mn, vel))
 
         for mn, (sf_, mx, has_onset) in active.items():
             dur = times[-1] - times[sf_]
-            if dur >= 0.06:
+            if dur >= 0.04:
                 vel = int(np.clip(mx * 3.5 + 30, 35, 127))
                 events.append((times[sf_], dur, mn, vel))
         return events
@@ -914,7 +914,9 @@ class EarCopyEngine:
             y_h, fmin=librosa.note_to_hz("C2"),
             fmax=librosa.note_to_hz("C7"), sr=sr, hop_length=HOP)
         times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
-        return self._f0_to_notes(f0, voiced, times, 8)
+        # 振幅エンベロープ（RMS）を同じフレーム数で算出
+        rms = librosa.feature.rms(y=y_h, frame_length=HOP * 2, hop_length=HOP)[0]
+        return self._f0_to_notes(f0, voiced, times, 8, rms)
 
     # ---- pyin ベース検出 ----------------------------------
 
@@ -923,14 +925,21 @@ class EarCopyEngine:
         nyq = sr / 2
         b, a = butter(4, min(250 / nyq, 0.99), btype="low")
         yb = filtfilt(b, a, y_h)
+        # ベース域拡張: C4 まで拾えるようにし、hop も高解像度に
         f0, voiced, _ = librosa.pyin(
             yb, fmin=librosa.note_to_hz("C1"),
-            fmax=librosa.note_to_hz("C3"), sr=sr, hop_length=HOP * 2)
-        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP * 2)
-        return self._f0_to_notes(f0, voiced, times, 4)
+            fmax=librosa.note_to_hz("C4"), sr=sr, hop_length=HOP)
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
+        rms = librosa.feature.rms(y=yb, frame_length=HOP * 2, hop_length=HOP)[0]
+        return self._f0_to_notes(f0, voiced, times, 4, rms)
 
-    def _f0_to_notes(self, f0, voiced, times, max_gap_hz):
+    def _f0_to_notes(self, f0, voiced, times, max_gap_hz, rms=None):
+        """f0 系列をノート化。振幅エンベロープ rms があれば、その区間平均から velocity を算出。"""
         events = []
+        # 振幅正規化用の参照値（全体の95%パーセンタイル）
+        rms_ref = float(np.percentile(rms, 95)) if (rms is not None and len(rms) > 0) else 0.0
+        if rms_ref <= 1e-6:
+            rms_ref = 1.0
         i = 0
         while i < len(f0):
             if voiced[i] and f0[i] is not None and not np.isnan(f0[i]):
@@ -944,10 +953,17 @@ class EarCopyEngine:
                     hz_list.append(f0[j])
                     j += 1
                 dur = times[min(j, len(times)-1)] - start_t
-                if dur >= 0.06:
+                if dur >= 0.04:
                     midi = int(np.clip(np.round(
                         librosa.hz_to_midi(np.mean(hz_list))), 0, 127))
-                    vel = min(int(80 + dur * 10), 120)
+                    # 振幅ベースの velocity（区間の最大振幅を基準値で正規化）
+                    if rms is not None and len(rms) > 0:
+                        seg = rms[i:min(j, len(rms))]
+                        amp = float(np.max(seg)) if len(seg) > 0 else 0.0
+                        amp_norm = min(amp / rms_ref, 1.5)  # 1.0 超過も許容
+                        vel = int(np.clip(30 + np.sqrt(amp_norm) * 90, 35, 120))
+                    else:
+                        vel = min(int(80 + dur * 10), 120)
                     events.append((start_t, min(dur, 4.0), midi, vel))
                 i = j
             else:
@@ -1405,11 +1421,11 @@ class EarCopyEngine:
                 _, _, note_events = predict(
                     tmp,
                     model_or_model_path=str(ICASSP_2022_MODEL_PATH),
-                    onset_threshold=0.5 if is_vocal else 0.35,
-                    frame_threshold=0.3,
-                    minimum_note_length=80 if is_vocal else 50,
-                    minimum_frequency=65.0 if is_vocal else 32.0,
-                    maximum_frequency=2000.0 if is_vocal else 4000.0,
+                    onset_threshold=0.35,  # 一律低め: 微小なアタックも拾う
+                    frame_threshold=0.27 if is_vocal else 0.25,  # フレーム連続性も緩め
+                    minimum_note_length=45 if is_vocal else 40,  # 短いパッセージも許容
+                    minimum_frequency=80.0 if is_vocal else 32.0,
+                    maximum_frequency=2400.0 if is_vocal else 5000.0,
                     melodia_trick=is_vocal,
                     midi_tempo=120,
                 )
@@ -1574,7 +1590,7 @@ class EarCopyEngine:
         # === 5. ポリフォニー制限（位相干渉・音の濁り防止） ===
         MAX_POLY = {'piano': 6, 'e_piano': 4, 'guitar_clean': 4,
                     'guitar_nylon': 4, 'strings': 6, 'glockenspiel': 3,
-                    'cello': 3, 'bass': 1, 'pad': 4, 'choir': 4}
+                    'cello': 3, 'bass': 2, 'pad': 4, 'choir': 4}
         for name in parts:
             limit = MAX_POLY.get(name, 4)
             evts = sorted(parts[name], key=lambda x: x[0])
@@ -1614,13 +1630,19 @@ class EarCopyEngine:
 
         quantized = []
         for (t, dur, midi, vel) in notes:
+            # 短い装飾音はグリッドに寄せない（原音のニュアンス保持）
+            if dur < 0.1:
+                quantized.append((t, dur, midi, vel))
+                continue
             idx = np.argmin(np.abs(grid - t))
             qt = grid[idx]
             dist = abs(qt - t)
             if dist > grid_step * 0.4:
                 qt = t  # グリッドから遠い→自然なタイミングを保持
             elif dist > grid_step * 0.15:
-                qt = t + (qt - t) * 0.5  # 中距離→半分だけスナップ
+                qt = t + (qt - t) * 0.25  # 中距離→25%だけスナップ（より自然）
+            else:
+                qt = t + (qt - t) * 0.6  # 近距離も完全スナップせず60%だけ
             # durationは元の長さを尊重（軽い丸めのみ）
             qdur = max(round(dur / grid_step) * grid_step, grid_step * 0.5)
             qdur = min(qdur, dur * 1.3)
