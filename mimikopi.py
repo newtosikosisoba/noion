@@ -169,6 +169,114 @@ import shutil
 import json
 from pathlib import Path
 
+# =====================================================
+# Transformer 採譜精製モジュール (torch オプション)
+# =====================================================
+
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+# --- MIDI トークン定数 (4-token グループ: TIME NOTE DUR VEL) ---
+_T_PAD      = 0
+_T_BOS      = 1
+_T_EOS      = 2
+_T_TIME_OFF = 3      # TIME: 0–500 (10ms 刻み, 最大 5000ms)
+_T_NOTE_OFF = 504    # NOTE: 0–127 (MIDI ノート番号)
+_T_DUR_OFF  = 632    # DUR:  0–200 (10ms 刻み, 最大 2000ms)
+_T_VEL_OFF  = 833    # VEL:  0–127 (MIDI ベロシティ)
+_T_VOCAB    = 961    # 総語彙数
+
+
+def notes_to_tokens(notes):
+    """[(onset_s, dur_s, midi, vel), ...] → List[int]  (BOS + 4tok*N + EOS)"""
+    import numpy as _np
+    toks = [_T_BOS]
+    for (t, d, m, v) in notes:
+        toks.extend([
+            _T_TIME_OFF + int(_np.clip(round(t * 100), 0, 500)),
+            _T_NOTE_OFF + int(_np.clip(m, 0, 127)),
+            _T_DUR_OFF  + int(_np.clip(round(d * 100), 0, 200)),
+            _T_VEL_OFF  + int(_np.clip(v, 0, 127)),
+        ])
+    toks.append(_T_EOS)
+    return toks
+
+
+def tokens_to_notes(toks):
+    """List[int] → [(onset_s, dur_s, midi, vel), ...]  (BOS/EOS/PAD を除外)"""
+    body = [t for t in toks if t not in (_T_PAD, _T_BOS, _T_EOS)]
+    notes = []
+    for i in range(0, len(body) - 3, 4):
+        t_tok, n_tok, d_tok, v_tok = body[i], body[i+1], body[i+2], body[i+3]
+        onset = (t_tok - _T_TIME_OFF) / 100.0
+        midi  = n_tok - _T_NOTE_OFF
+        dur   = (d_tok - _T_DUR_OFF) / 100.0
+        vel   = v_tok - _T_VEL_OFF
+        if (0.0 <= onset and 0.0 < dur <= 20.0
+                and 0 <= midi <= 127 and 0 <= vel <= 127):
+            notes.append((onset, dur, int(midi), int(vel)))
+    return notes
+
+
+def corrupt_notes(notes, pitch_jitter=2, time_jitter=0.03, dropout=0.10, rng=None):
+    """学習データ生成: ノートにランダムノイズを加えて汚染する。
+    pitch_jitter: ±半音数  time_jitter: ±秒  dropout: 削除確率
+    """
+    import numpy as _np
+    if rng is None:
+        rng = _np.random.default_rng()
+    corrupted = []
+    for (t, d, m, v) in notes:
+        if rng.random() < dropout:
+            continue
+        dm = int(rng.integers(-pitch_jitter, pitch_jitter + 1))
+        dt = float(rng.uniform(-time_jitter, time_jitter))
+        corrupted.append((
+            max(0.0, t + dt),
+            d,
+            int(_np.clip(m + dm, 0, 127)),
+            v,
+        ))
+    return sorted(corrupted, key=lambda x: x[0])
+
+
+if HAS_TORCH:
+    class MusicTransformer(nn.Module):
+        """4 層 Transformer Encoder: ノートシーケンスのデノイジング精製用。
+        入力: トークン列 (B, T)  出力: ロジット (B, T, VOCAB)
+        """
+        def __init__(self, vocab=_T_VOCAB, d_model=128, nhead=4,
+                     num_layers=4, dim_ff=256, max_len=512, dropout=0.1):
+            super().__init__()
+            self.embed   = nn.Embedding(vocab, d_model, padding_idx=_T_PAD)
+            self.pos_enc = nn.Embedding(max_len, d_model)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=nhead,
+                dim_feedforward=dim_ff, dropout=dropout,
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+            self.head    = nn.Linear(d_model, vocab)
+
+        def forward(self, x, src_key_padding_mask=None):
+            """x: (B, T) int → (B, T, VOCAB) float"""
+            B, T = x.shape
+            pos = torch.arange(T, device=x.device).unsqueeze(0)
+            h = self.embed(x) + self.pos_enc(pos)
+            h = self.encoder(h, src_key_padding_mask=src_key_padding_mask)
+            return self.head(h)
+else:
+    # torch 未インストール時はダミークラスを定義
+    class MusicTransformer:  # type: ignore[no-redef]
+        """torch 未インストール時のスタブ。_transformer_refine は no-op になる。"""
+        def __init__(self, **_):
+            pass
+
+
 # tkinter は GUI モード時のみインポート（CLIモードでは不要）
 tk = None
 ttk = None
@@ -1070,6 +1178,135 @@ class EarCopyEngine:
                 existing_times.add(time_key)
         return sorted(notes + additions, key=lambda x: x[0])
 
+    # ---- Transformer 精製 ----------------------------------------
+
+    def _transformer_refine(self, notes):
+        """MusicTransformer でノートシーケンスを精製する（推論専用）。
+        torch 未インストール / シーケンス過長 / エラー時は元ノートをそのまま返す。
+        現在は未学習モデルのため no-op フォールバックが基本動作。
+        """
+        if not HAS_TORCH or not notes:
+            return notes
+        try:
+            model = MusicTransformer()
+            model.eval()
+            toks = notes_to_tokens(notes)
+            max_len = 512
+            if len(toks) > max_len:
+                return notes
+            pad_len = max_len - len(toks)
+            padded  = toks + [_T_PAD] * pad_len
+            x    = torch.tensor([padded], dtype=torch.long)
+            mask = (x == _T_PAD)
+            with torch.no_grad():
+                logits  = model(x, src_key_padding_mask=mask[0])
+                pred    = logits[0].argmax(dim=-1).tolist()
+            refined = tokens_to_notes(pred[:len(toks)])
+            # 精製後に大幅にノートが減る場合は元を使う（未学習モデル対策）
+            if len(refined) < len(notes) * 0.5:
+                return notes
+            return refined
+        except Exception:
+            return notes
+
+    # ---- Sound Horizon 最適化 ------------------------------------
+
+    def _thicken_chords(self, notes, chords):
+        """コード内声部充填: 検出コードに対し不足する構成音を中声部に追加する。
+        Sound Horizon スタイルの豊かなハーモニーを実現。
+        """
+        if not chords or not notes:
+            return notes
+        additions = []
+        for (ct, root_name, quality, cdur) in chords:
+            root_pc = self.NOTE_MIDI.get(root_name, 0)
+            chord_ivs = self.CHORD_IV.get(quality, [0, 4, 7])
+            present = [n for n in notes if ct <= n[0] < ct + cdur]
+            present_pcs = set(n[2] % 12 for n in present)
+            avg_vel = int(np.mean([n[3] for n in present])) if present else 55
+            for iv in chord_ivs:
+                target_pc = (root_pc + iv) % 12
+                if target_pc not in present_pcs:
+                    # 中声部 (MIDI 48–84) に追加
+                    midi_note = 60 + target_pc
+                    if midi_note > 84:
+                        midi_note -= 12
+                    if 48 <= midi_note <= 84:
+                        additions.append((
+                            ct + cdur * 0.05,
+                            min(cdur * 0.7, 0.6),
+                            midi_note,
+                            int(avg_vel * 0.65),
+                        ))
+                        present_pcs.add(target_pc)
+        return sorted(notes + additions, key=lambda x: x[0])
+
+    def _extend_sustains(self, notes):
+        """サスティン延長: 同一ピッチ間の短いギャップをレガートで埋める。
+        Sound Horizon スタイルの流れるような旋律感を演出。
+        """
+        if not notes:
+            return notes
+        by_pitch = {}
+        for n in notes:
+            by_pitch.setdefault(n[2], []).append(n)
+        result = list(notes)
+        for midi, group in by_pitch.items():
+            group = sorted(group, key=lambda x: x[0])
+            for i in range(len(group) - 1):
+                t, d, m, v = group[i]
+                t_next = group[i + 1][0]
+                gap = t_next - (t + d)
+                # 50ms 以内のギャップはサスティンで埋める
+                if 0.0 < gap <= 0.05:
+                    idx = result.index(group[i])
+                    if idx >= 0:
+                        result[idx] = (t, d + gap * 0.9, m, v)
+        return sorted(result, key=lambda x: x[0])
+
+    def _detect_modulation(self, y, sr, beats):
+        """転調検出: 楽曲を区間分割してキー変化を検出する。
+        Returns: [(time_s, scale_set, scale_name), ...]  昇順
+        """
+        try:
+            if beats is None or len(beats) < 8:
+                ss, sn = self._estimate_key(y, sr)
+                return [(0.0, ss, sn)]
+            beats_per_section = 16  # 4小節 @ 4/4
+            sections = []
+            step = max(beats_per_section // 2, 1)
+            for i in range(0, len(beats) - beats_per_section, step):
+                t_start = float(beats[i])
+                t_end   = float(beats[min(i + beats_per_section, len(beats) - 1)])
+                s_start = int(t_start * sr)
+                s_end   = int(min(t_end * sr, len(y)))
+                if s_end - s_start < sr:
+                    continue
+                ss, sn = self._estimate_key(y[s_start:s_end], sr)
+                sections.append((t_start, ss, sn))
+            if not sections:
+                ss, sn = self._estimate_key(y, sr)
+                return [(0.0, ss, sn)]
+            # 連続同キー区間を統合
+            modulations = [sections[0]]
+            for t, ss, sn in sections[1:]:
+                if ss != modulations[-1][1]:
+                    modulations.append((t, ss, sn))
+            return modulations
+        except Exception:
+            ss, sn = self._estimate_key(y, sr)
+            return [(0.0, ss, sn)]
+
+    def _scale_set_at(self, modulations, t):
+        """指定時刻に対応するスケールセットを返す。"""
+        result = modulations[0][1] if modulations else None
+        for mt, ss, _ in modulations:
+            if mt <= t:
+                result = ss
+            else:
+                break
+        return result
+
     def _score_audio(self, original_y, synth_y, sr):
         """スペクトル差分による採譜品質スコア（0-100）。原音波形は評価のみに使用。"""
         try:
@@ -1518,6 +1755,11 @@ class EarCopyEngine:
         if scale_set is not None:
             self._log(f"  推定キー: {scale_name}", 30)
 
+        # 転調検出（Sound Horizon 対応）
+        modulations = self._detect_modulation(y, sr, beats)
+        if len(modulations) > 1:
+            self._log(f"  転調検出: {len(modulations)} キー変化", 30)
+
         tq = getattr(self, 'transcription_quality', 'balanced')
         self._log(f"採譜モード: {tq}", 30)
 
@@ -1536,12 +1778,14 @@ class EarCopyEngine:
             self._log("ボーカルを多声部採譜中 (Basic Pitch)...", 33)
             vocal_stem = self._preprocess_stem(stems["vocals"], sr, 'vocals')
             vocal_notes = self._basic_pitch_notes(vocal_stem, sr, is_vocal=True)
+            vocal_notes = self._transformer_refine(vocal_notes)
             vocal_notes = self._remove_overlapping_notes(vocal_notes)
             self._log_midi_stats("ボーカル採譜結果", vocal_notes)
 
         self._log("その他楽器を多声部採譜中 (Basic Pitch)...", 42)
         other_stem = self._preprocess_stem(stems["other"], sr, 'other')
         other_notes = self._basic_pitch_notes(other_stem, sr, is_vocal=False)
+        other_notes = self._transformer_refine(other_notes)
         other_notes = self._remove_overlapping_notes(other_notes)
         self._log_midi_stats("その他採譜結果", other_notes)
 
@@ -1577,7 +1821,13 @@ class EarCopyEngine:
         self._log("  ハーモニー補完...", 68)
         other_notes = self._fill_harmony(other_notes, chords, tempo)
 
-        # 3e. Velocity はクランプのみ（元のダイナミクスを潰さない）
+        # 3e. Sound Horizon 最適化: コード内声部充填 + サスティン延長
+        self._log("  Sound Horizon 最適化...", 69)
+        other_notes = self._thicken_chords(other_notes, chords)
+        other_notes = self._extend_sustains(other_notes)
+        vocal_notes = self._extend_sustains(vocal_notes)
+
+        # 3f. Velocity はクランプのみ（元のダイナミクスを潰さない）
         vocal_notes = self._normalize_velocity(vocal_notes, 50, 120)
         other_notes = self._normalize_velocity(other_notes, 35, 115)
         bass_notes  = self._normalize_velocity(bass_notes,  55, 120)
