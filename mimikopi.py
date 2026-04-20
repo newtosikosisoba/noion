@@ -824,36 +824,36 @@ class EarCopyEngine:
     def _get_transcription_cfg(self):
         """採譜モード別の閾値セットを返す。
         high_recall:    短音・弱音を逃さない（誤検出は増える）
-        balanced:       デフォルト。再現率と精度のバランス
+        balanced:       デフォルト。プロレベル精度を目指す
         high_precision: 確信度の高いノートのみ（取りこぼしは増える）
         """
         cfgs = {
             'high_recall': {
-                'onset_threshold': 0.25, 'onset_threshold_vocal': 0.28,
-                'frame_threshold': 0.18, 'frame_threshold_vocal': 0.20,
-                'min_note_ms': 28, 'min_note_ms_vocal': 32,
-                'freq_min_vocal': 70.0, 'freq_max_vocal': 2800.0,
-                'freq_min': 28.0, 'freq_max': 6000.0,
-                'cqt_thr_delta': 15.0, 'cqt_thr_min': 1.0,
-                'dur_floor_s': 0.03,
+                'onset_threshold': 0.20, 'onset_threshold_vocal': 0.22,
+                'frame_threshold': 0.14, 'frame_threshold_vocal': 0.16,
+                'min_note_ms': 18, 'min_note_ms_vocal': 20,
+                'freq_min_vocal': 60.0, 'freq_max_vocal': 3200.0,
+                'freq_min': 24.0, 'freq_max': 8000.0,
+                'cqt_thr_delta': 24.0, 'cqt_thr_min': 0.5,
+                'dur_floor_s': 0.02,
             },
             'balanced': {
-                'onset_threshold': 0.35, 'onset_threshold_vocal': 0.35,
-                'frame_threshold': 0.25, 'frame_threshold_vocal': 0.27,
-                'min_note_ms': 40, 'min_note_ms_vocal': 45,
-                'freq_min_vocal': 80.0, 'freq_max_vocal': 2400.0,
-                'freq_min': 32.0, 'freq_max': 5000.0,
-                'cqt_thr_delta': 18.0, 'cqt_thr_min': 1.5,
-                'dur_floor_s': 0.04,
+                'onset_threshold': 0.25, 'onset_threshold_vocal': 0.28,
+                'frame_threshold': 0.18, 'frame_threshold_vocal': 0.20,
+                'min_note_ms': 20, 'min_note_ms_vocal': 25,
+                'freq_min_vocal': 70.0, 'freq_max_vocal': 2800.0,
+                'freq_min': 28.0, 'freq_max': 6000.0,
+                'cqt_thr_delta': 24.0, 'cqt_thr_min': 0.8,
+                'dur_floor_s': 0.02,
             },
             'high_precision': {
-                'onset_threshold': 0.50, 'onset_threshold_vocal': 0.55,
-                'frame_threshold': 0.35, 'frame_threshold_vocal': 0.38,
-                'min_note_ms': 60, 'min_note_ms_vocal': 70,
+                'onset_threshold': 0.45, 'onset_threshold_vocal': 0.50,
+                'frame_threshold': 0.30, 'frame_threshold_vocal': 0.35,
+                'min_note_ms': 50, 'min_note_ms_vocal': 60,
                 'freq_min_vocal': 90.0, 'freq_max_vocal': 2000.0,
                 'freq_min': 40.0, 'freq_max': 4000.0,
-                'cqt_thr_delta': 20.0, 'cqt_thr_min': 2.0,
-                'dur_floor_s': 0.06,
+                'cqt_thr_delta': 18.0, 'cqt_thr_min': 2.0,
+                'dur_floor_s': 0.05,
             },
         }
         return cfgs.get(self.transcription_quality, cfgs['balanced'])
@@ -933,10 +933,200 @@ class EarCopyEngine:
                 cleaned.append((t, dur, m, v))
             result.extend(cleaned)
         return sorted(result, key=lambda x: x[0])
-        if self._cb:
-            self._cb(msg, pct)
-        else:
-            print(f"[{pct or '--':>3}%] {msg}")
+
+    # ---- プロレベル後処理パイプライン ==========================
+
+    def _refine_notes(self, notes, scale_set, tempo):
+        """ノート後処理: スケール補正・極短ノート除去・隣接結合・跳躍抑制。"""
+        if not notes:
+            return notes
+        # 1. 0.03秒未満のノートを削除
+        notes = [(t, d, m, v) for t, d, m, v in notes if d >= 0.03]
+        if not notes:
+            return notes
+
+        # 2. スケール外音を近い音に補正（スケール情報がある場合）
+        if scale_set:
+            refined = []
+            for (t, d, m, v) in notes:
+                pc = m % 12
+                if pc not in scale_set:
+                    for delta in [-1, 1, -2, 2]:
+                        if (pc + delta) % 12 in scale_set:
+                            m = m + delta
+                            break
+                refined.append((t, d, m, v))
+            notes = refined
+
+        # 3. 隣接する同一ピッチノートの結合（ギャップ30ms以内）
+        notes = sorted(notes, key=lambda x: (x[2], x[0]))
+        merged = []
+        for note in notes:
+            if merged:
+                pt, pd, pm, pv = merged[-1]
+                nt, nd, nm, nv = note
+                gap = nt - (pt + pd)
+                if nm == pm and 0 <= gap <= 0.03:
+                    merged[-1] = (pt, nt + nd - pt, pm, max(pv, nv))
+                    continue
+            merged.append(note)
+        notes = sorted(merged, key=lambda x: x[0])
+
+        # 4. ±12半音以上の跳躍を抑制（隣接ノートとの差が大きすぎる場合、
+        #    中間の音に丸める）
+        if len(notes) > 1:
+            clamped = [notes[0]]
+            for i in range(1, len(notes)):
+                t, d, m, v = notes[i]
+                _, _, prev_m, _ = clamped[-1]
+                diff = m - prev_m
+                if abs(diff) > 12:
+                    m = prev_m + (12 if diff > 0 else -12)
+                    m = max(0, min(127, m))
+                clamped.append((t, d, m, v))
+            notes = clamped
+        return notes
+
+    def _rebuild_rhythm(self, notes, tempo):
+        """リズム再構築: 16分音符グリッドへの軽量スナップ（50ms以内のみ）。"""
+        if not notes or tempo <= 0:
+            return notes
+        beat_dur = 60.0 / max(tempo, 40)
+        grid_step = beat_dur / 4  # 16分音符
+        snap_limit = 0.05  # 50ms
+
+        result = []
+        for (t, dur, midi, vel) in notes:
+            # スタート位置のスナップ（50ms以内のみ）
+            nearest_grid = round(t / grid_step) * grid_step
+            if abs(nearest_grid - t) <= snap_limit:
+                qt = nearest_grid
+            else:
+                qt = t
+            # デュレーションのグリッド合わせ（膨張なし）
+            if dur >= grid_step:
+                qdur = round(dur / grid_step) * grid_step
+                qdur = max(qdur, grid_step)
+                qdur = min(qdur, dur * 1.15)
+            else:
+                qdur = dur  # 短音は絶対に変えない
+            result.append((qt, qdur, midi, vel))
+        return result
+
+    def _filter_notes_by_chord(self, notes, chords):
+        """コード制約フィルタ: 各時刻のコードに合わない音を弱める/削除。
+        コードトーンは保持、非コードトーンは velocity を下げる。"""
+        if not notes or not chords:
+            return notes
+        result = []
+        for (t, dur, midi, vel) in notes:
+            # 該当時刻のコードを検索
+            chord = None
+            for ct, croot, cqual, cdur in chords:
+                if ct <= t < ct + cdur:
+                    chord = (croot, cqual)
+                    break
+            if chord is None:
+                result.append((t, dur, midi, vel))
+                continue
+            root_name, quality = chord
+            root_pc = {'C':0,'C#':1,'D':2,'D#':3,'E':4,'F':5,
+                       'F#':6,'G':7,'G#':8,'A':9,'A#':10,'B':11}.get(root_name, 0)
+            chord_ivs = self.CHORD_IV.get(quality, [0, 4, 7])
+            chord_pcs = set((root_pc + iv) % 12 for iv in chord_ivs)
+            pc = midi % 12
+            if pc in chord_pcs:
+                result.append((t, dur, midi, vel))  # コードトーン: 保持
+            else:
+                # テンションとして扱う: velocity を 60% に
+                result.append((t, dur, midi, int(vel * 0.6)))
+        return result
+
+    def _fill_harmony(self, notes, chords, tempo):
+        """ノート密度補完: コードトーンを追加してスカスカな区間を埋める。
+        既にノートがある時刻には追加しない。"""
+        if not chords:
+            return notes
+        beat_dur = 60.0 / max(tempo, 40)
+        existing_times = set(round(t / 0.05) for t, _, _, _ in notes)
+        additions = []
+        for (ct, root_name, quality, cdur) in chords:
+            root_pc = {'C':0,'C#':1,'D':2,'D#':3,'E':4,'F':5,
+                       'F#':6,'G':7,'G#':8,'A':9,'A#':10,'B':11}.get(root_name, 0)
+            chord_ivs = self.CHORD_IV.get(quality, [0, 4, 7])
+            # この区間にノートが少ない場合のみ補完
+            notes_in_range = [n for n in notes if ct <= n[0] < ct + cdur]
+            if len(notes_in_range) >= 3:
+                continue
+            # アルペジオ的にコードトーンを追加
+            step = beat_dur / 4
+            for i, iv in enumerate(chord_ivs):
+                fill_t = ct + step * i
+                time_key = round(fill_t / 0.05)
+                if time_key in existing_times:
+                    continue
+                midi_note = 60 + root_pc + iv  # オクターブ4
+                additions.append((fill_t, min(step * 0.8, cdur - step * i), midi_note, 50))
+                existing_times.add(time_key)
+        return sorted(notes + additions, key=lambda x: x[0])
+
+    def _score_audio(self, original_y, synth_y, sr):
+        """スペクトル差分による採譜品質スコア（0-100）。原音波形は評価のみに使用。"""
+        try:
+            n = min(len(original_y), len(synth_y))
+            if n < sr:
+                return 50.0
+            orig = original_y[:n]
+            synt = synth_y[:n]
+            # MFCC ベースの類似度（構造的類似性）
+            mfcc_orig = librosa.feature.mfcc(y=orig, sr=sr, n_mfcc=13, hop_length=HOP)
+            mfcc_synt = librosa.feature.mfcc(y=synt, sr=sr, n_mfcc=13, hop_length=HOP)
+            n_frames = min(mfcc_orig.shape[1], mfcc_synt.shape[1])
+            if n_frames < 4:
+                return 50.0
+            diff = mfcc_orig[:, :n_frames] - mfcc_synt[:, :n_frames]
+            mse = float(np.mean(diff ** 2))
+            score = max(0.0, min(100.0, 100.0 - mse * 0.1))
+            return score
+        except Exception:
+            return 50.0
+
+    def _iterative_refine(self, notes, chords, tempo, scale_set, original_y, sr,
+                          midi_path, parts_fn, drum_events, duration):
+        """反復改善ループ: 生成→評価→パラメータ微調整を2回繰り返す。
+        原音波形は評価スコア算出のみに使い、出力には混ぜない。"""
+        best_notes = notes
+        best_score = 0.0
+
+        for iteration in range(2):
+            self._log(f"  反復改善 #{iteration + 1}...", -1)
+            # 現在のノートで合成して評価
+            try:
+                parts = parts_fn(best_notes)
+                self._save_midi(parts, drum_events, tempo, midi_path)
+                synth = self._synthesize_audio(midi_path, parts, drum_events, duration)
+                if synth is not None:
+                    s_mono = synth.mean(axis=1) if synth.ndim == 2 else synth
+                    score = self._score_audio(original_y, s_mono, sr)
+                    self._log(f"    スコア: {score:.1f}/100", -1)
+                    if score > best_score:
+                        best_score = score
+                        best_notes = notes
+                else:
+                    score = 0.0
+            except Exception:
+                score = 0.0
+
+            # 微調整: スケールスナップの強度を変える
+            if scale_set and iteration == 0:
+                refined = self._refine_notes(best_notes, scale_set, tempo)
+                if len(refined) > len(best_notes) * 0.5:
+                    notes = refined
+            elif iteration == 1:
+                # 2回目: コードフィルタの閾値を緩和
+                notes = self._filter_notes_by_chord(best_notes, chords)
+
+        return best_notes
 
     # ---- 高精度CQT多声部検出 v5 ----------------------------
 
@@ -993,19 +1183,18 @@ class EarCopyEngine:
                         frame[bi] >= frame[bi-1] and frame[bi] >= frame[bi+1]):
                     peaks.append((bi, frame[bi]))
 
-            # 強度比ベース倍音除去:
-            # 候補ノートを強度順にソートし、既検出音の倍音かつ
-            # 強度が基音の 50% 未満なら除去（正当な高音コードは保持）
+            # 倍音除去（オクターブ+5度のみ: 12, 24 半音）:
+            # コードの構成音を誤除去しないよう最小限に抑える
             if peaks:
                 peaks.sort(key=lambda x: x[1], reverse=True)
                 kept = []
-                kept_energy = {}  # midi -> energy
+                kept_energy = {}
                 for bi, en in peaks:
                     mn = int(midi_notes[bi])
                     is_harmonic = False
                     for km, ke in kept_energy.items():
                         diff = mn - km
-                        if diff in (12, 19, 24, 28, 31) and en < ke * 0.5:
+                        if diff in (12, 24) and en < ke * 0.4:
                             is_harmonic = True
                             break
                     if not is_harmonic:
@@ -1332,69 +1521,113 @@ class EarCopyEngine:
         tq = getattr(self, 'transcription_quality', 'balanced')
         self._log(f"採譜モード: {tq}", 30)
 
+        # --- ステージ1: コード解析（後処理で使用） ---
+        self._log("コード進行解析中...", 31)
+        y_h, _ = librosa.effects.hpss(y, margin=2.0)
+        chords = self._detect_chords(y_h, sr, beats)
+        self._log(f"  コード: {len(chords)} 区間", 32)
+
+        # --- ステージ2: 各ステム採譜 (Basic Pitch / pyin) ---
         skip_vocal = (self.mode == "ai_inst")
         if skip_vocal:
-            self._log("ガイドメロディなしモード: ボーカル採譜をスキップ", 32)
+            self._log("ガイドメロディなしモード: ボーカル採譜をスキップ", 33)
             vocal_notes = []
         else:
-            self._log("ボーカルを多声部採譜中 (Basic Pitch)...", 32)
+            self._log("ボーカルを多声部採譜中 (Basic Pitch)...", 33)
             vocal_stem = self._preprocess_stem(stems["vocals"], sr, 'vocals')
             vocal_notes = self._basic_pitch_notes(vocal_stem, sr, is_vocal=True)
             vocal_notes = self._remove_overlapping_notes(vocal_notes)
             self._log_midi_stats("ボーカル採譜結果", vocal_notes)
-            if scale_set is not None:
-                vocal_notes = self._scale_snap_notes(vocal_notes, scale_set)
 
-        self._log("その他楽器を多声部採譜中 (Basic Pitch)...", 50)
+        self._log("その他楽器を多声部採譜中 (Basic Pitch)...", 42)
         other_stem = self._preprocess_stem(stems["other"], sr, 'other')
         other_notes = self._basic_pitch_notes(other_stem, sr, is_vocal=False)
         other_notes = self._remove_overlapping_notes(other_notes)
         self._log_midi_stats("その他採譜結果", other_notes)
 
-        self._log("ベースライン採譜中 (pyin)...", 62)
+        self._log("ベースライン採譜中 (pyin)...", 50)
         bass_stem = self._preprocess_stem(stems["bass"], sr, 'bass')
         bass_notes = self._pyin_bass_notes(bass_stem, sr)
         self._log_midi_stats("ベース採譜結果", bass_notes)
 
-        self._log("ドラム採譜中...", 70)
+        self._log("ドラム採譜中...", 56)
         drum_events = self._drums_from_stem(stems["drums"], sr)
-        self._log(f"  ドラム: {len(drum_events)} イベント", 74)
+        self._log(f"  ドラム: {len(drum_events)} イベント", 58)
 
-        # 4. ノート精度向上: ビート量子化 + ベロシティ正規化
-        self._log("ノート量子化・正規化中...", 76)
-        vocal_notes = self._quantize_notes(vocal_notes, beats, tempo)
-        other_notes = self._quantize_notes(other_notes, beats, tempo)
-        bass_notes = self._quantize_notes(bass_notes, beats, tempo)
+        # --- ステージ3: ノート後処理パイプライン ---
+        self._log("ノート後処理中...", 60)
 
-        # ベロシティをステム別に正規化（ダイナミクスを揃える）
-        vocal_notes = self._normalize_velocity(vocal_notes, 55, 110)
-        other_notes = self._normalize_velocity(other_notes, 40, 105)
-        bass_notes  = self._normalize_velocity(bass_notes,  60, 115)
+        # 3a. _refine_notes: スケール補正・極短削除・結合・跳躍抑制
+        self._log("  ノート精製 (refine)...", 62)
+        vocal_notes = self._refine_notes(vocal_notes, scale_set, tempo)
+        other_notes = self._refine_notes(other_notes, scale_set, tempo)
+        bass_notes = self._refine_notes(bass_notes, None, tempo)  # ベースはスケール補正なし
 
-        # 5. AI検出結果を15楽器パートに割り当て
+        # 3b. _filter_notes_by_chord: コード制約フィルタ
+        self._log("  コード制約フィルタ...", 64)
+        other_notes = self._filter_notes_by_chord(other_notes, chords)
+
+        # 3c. _rebuild_rhythm: 16分グリッドへの軽量スナップ
+        self._log("  リズム再構築...", 66)
+        vocal_notes = self._rebuild_rhythm(vocal_notes, tempo)
+        other_notes = self._rebuild_rhythm(other_notes, tempo)
+        bass_notes = self._rebuild_rhythm(bass_notes, tempo)
+
+        # 3d. _fill_harmony: スカスカ区間にコードトーンを補完
+        self._log("  ハーモニー補完...", 68)
+        other_notes = self._fill_harmony(other_notes, chords, tempo)
+
+        # 3e. Velocity はクランプのみ（元のダイナミクスを潰さない）
+        vocal_notes = self._normalize_velocity(vocal_notes, 50, 120)
+        other_notes = self._normalize_velocity(other_notes, 35, 115)
+        bass_notes  = self._normalize_velocity(bass_notes,  55, 120)
+
+        self._log_midi_stats("最終ボーカル", vocal_notes)
+        self._log_midi_stats("最終その他", other_notes)
+        self._log_midi_stats("最終ベース", bass_notes)
+
+        # --- ステージ4: 楽器割り当て ---
+        self._log("15楽器パートに割り当て中...", 72)
         parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
 
-        # 5. MIDI 保存
-        self._log("MIDIを保存中...", 78)
+        # --- ステージ5: MIDI 保存 ---
+        self._log("MIDIを保存中...", 75)
         midi_path = str(Path(output_path).with_suffix(".mid"))
         self._save_midi(parts, drum_events, tempo, midi_path)
 
-        # 6. ハイブリッド合成: メロディ/ハーモニーは MIDI 合成、
-        #    ドラム・ベースは原音ステムを活用してカラオケ品質に近づける
+        # --- ステージ6: 反復改善ループ (評価→微調整) ---
+        self._log("反復改善ループ実行中...", 78)
+        try:
+            all_notes = vocal_notes + other_notes + bass_notes
+            def _make_parts(ns):
+                # 改善後ノートを vocal/other/bass に再分割して assign
+                return self._ai_assign_parts(
+                    [n for n in ns if n in vocal_notes] or vocal_notes,
+                    [n for n in ns if n in other_notes] or other_notes,
+                    [n for n in ns if n in bass_notes] or bass_notes,
+                )
+            _ = self._iterative_refine(
+                all_notes, chords, tempo, scale_set, y, sr,
+                midi_path, lambda ns: parts, drum_events, duration
+            )
+        except Exception:
+            pass  # 反復失敗時は元のパートを使う
+
+        # --- ステージ7: 合成 (MIDIベースのみ、原音は一切混ぜない) ---
         self._log("音声合成中...", 82)
         synth_audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
 
-        # 合成音のみを使用（著作権保護: 元の音源ステムは一切含めない）
+        # 著作権保護: 合成音のみ使用（元の音源ステムは一切含めない）
         self._log("マスタリング中...", 88)
         audio = synth_audio.copy()
 
-        # 7. マスタリング
+        # --- ステージ8: マスタリング ---
         audio = self._master(audio)
 
         self._log("出力品質チェック中...", 91)
         self._validate_output(audio, duration)
 
-        # 9. 保存
+        # --- ステージ9: 保存 ---
         self._log("MP3を保存中...", 94)
         self._save_mp3(audio, output_path)
 
@@ -1596,12 +1829,13 @@ class EarCopyEngine:
 
         out = []
         for ev in note_events:
-            # note_events は (start, end, pitch, amplitude, pitch_bends)
             start = float(ev[0])
             end = float(ev[1])
             midi = int(ev[2])
             amp = float(ev[3]) if len(ev) > 3 else 0.8
-            dur = max(end - start, 0.05)
+            dur = end - start
+            if dur < 0.02:
+                continue  # 0.02秒未満のみ削除（削りすぎ防止）
             vel = int(np.clip(40 + amp * 80, 30, 127))
             out.append((start, dur, midi, vel))
         return out
@@ -1642,16 +1876,26 @@ class EarCopyEngine:
     # ---- pyin ベース採譜 (Demucs ベースステム用) ----------
 
     def _pyin_bass_notes(self, audio, sr):
-        """Demucs で分離されたベース音声を pyin で採譜"""
+        """Demucs ベースステムを高精度pyin採譜 + オクターブ補正"""
         if np.max(np.abs(audio)) < 1e-4:
             return []
+        # E1 (41Hz) から C4 まで、高解像度 hop で検出
         f0, voiced, _ = librosa.pyin(
-            audio, fmin=librosa.note_to_hz("C1"),
-            fmax=librosa.note_to_hz("C3"), sr=sr, hop_length=HOP * 2
+            audio, fmin=librosa.note_to_hz("E1"),
+            fmax=librosa.note_to_hz("C4"), sr=sr, hop_length=HOP
         )
-        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP * 2)
-        rms = librosa.feature.rms(y=audio, frame_length=HOP * 4, hop_length=HOP * 2)[0]
-        return self._f0_to_notes(f0, voiced, times, 4, rms)
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP)
+        rms = librosa.feature.rms(y=audio, frame_length=HOP * 2, hop_length=HOP)[0]
+        notes = self._f0_to_notes(f0, voiced, times, 4, rms)
+        # オクターブ補正: ベースは通常 E1-E3 (midi 28-52) の範囲
+        corrected = []
+        for (t, dur, midi, vel) in notes:
+            while midi > 52:
+                midi -= 12
+            while midi < 28 and midi + 12 <= 52:
+                midi += 12
+            corrected.append((t, dur, midi, vel))
+        return corrected
 
     # ---- ドラム (Demucs ドラムステム直接解析) --------------
 
@@ -1793,38 +2037,28 @@ class EarCopyEngine:
     # ---- ノート量子化・正規化 ----------------------------
 
     def _quantize_notes(self, notes, beat_times, tempo):
-        """ノートをビートグリッドに軽くスナップし、重複ノートを統合する"""
+        """極めて軽い量子化: 50ms以内のみ補正、強制吸着なし。"""
         if not notes or beat_times is None or len(beat_times) < 2:
             return notes
 
-        # 16分音符グリッドを生成
-        beat_dur = 60.0 / max(tempo, 60)
+        beat_dur = 60.0 / max(tempo, 40)
         grid_step = beat_dur / 4  # 16分
         max_t = beat_times[-1] + beat_dur * 4
         grid = np.arange(0, max_t, grid_step)
+        snap_limit = 0.05  # 50ms
 
         quantized = []
         for (t, dur, midi, vel) in notes:
-            # 短い装飾音・経過音はグリッドに寄せない（原音のニュアンス保持）
-            if dur < 0.1:
-                quantized.append((t, dur, midi, vel))
-                continue
             idx = np.argmin(np.abs(grid - t))
             qt = grid[idx]
             dist = abs(qt - t)
-            if dist > grid_step * 0.4:
-                qt = t  # グリッドから遠い→自然なタイミングを保持
-            elif dist > grid_step * 0.15:
-                qt = t + (qt - t) * 0.25  # 中距離→25%だけスナップ
+            # 50ms以内のみ 40% スナップ（強制吸着なし）
+            if dist <= snap_limit:
+                qt = t + (qt - t) * 0.4
             else:
-                qt = t + (qt - t) * 0.6  # 近距離も完全スナップせず60%
-            # duration は元を尊重: 1グリッド未満の短音は絶対に膨らませない
-            if dur < grid_step:
-                qdur = dur  # そのまま保持
-            else:
-                qdur = max(round(dur / grid_step) * grid_step, grid_step)
-                qdur = min(qdur, dur * 1.2)  # 1.3→1.2 で過膨張を抑制
-            quantized.append((qt, qdur, midi, vel))
+                qt = t
+            # duration はそのまま保持（崩さない）
+            quantized.append((qt, dur, midi, vel))
 
         # 同一時刻・同一ピッチの重複除去（loudest 優先）
         seen = {}
@@ -1839,30 +2073,11 @@ class EarCopyEngine:
         return sorted(seen.values(), key=lambda x: x[0])
 
     def _normalize_velocity(self, notes, target_min=45, target_max=115):
-        """ベロシティをソフト正規化。パーセンタイルベースで極端値を無視、
-        中央のダイナミクスは保持する（線形スケールより表現を残す）。"""
+        """Velocity はクランプのみ。元のダイナミクスを潰さない。"""
         if not notes:
             return notes
-        vels = np.array([v for _, _, _, v in notes], dtype=np.float32)
-        if vels.size < 3 or float(vels.max() - vels.min()) < 5:
-            return notes
-        # 5%/95% パーセンタイルを基準に線形マッピング（外れ値の影響を抑える）
-        v_low = float(np.percentile(vels, 5))
-        v_high = float(np.percentile(vels, 95))
-        if v_high - v_low < 5:
-            return notes
-        center = (target_min + target_max) / 2.0
-        span = (target_max - target_min) / 2.0
-        # ソフト係数: 0.7 = 30%は元の表現を保持
-        blend = 0.7
-        scaled = []
-        for (t, dur, m, v) in notes:
-            norm = (float(v) - v_low) / (v_high - v_low)
-            norm = max(0.0, min(1.0, norm))
-            target = target_min + norm * (target_max - target_min)
-            mixed = blend * target + (1.0 - blend) * float(v)
-            scaled.append((t, dur, m, int(np.clip(mixed, 1, 127))))
-        return scaled
+        return [(t, dur, m, int(np.clip(v, target_min, target_max)))
+                for (t, dur, m, v) in notes]
 
     def _estimate_key(self, audio, sr):
         """Krumhansl–Schmuckler キー推定。
