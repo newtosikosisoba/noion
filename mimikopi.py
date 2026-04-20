@@ -1228,9 +1228,9 @@ class EarCopyEngine:
         self._log("音声合成中...", 82)
         synth_audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
 
-        # ハイブリッドミキシング: 合成音を基準に、原音ステムをRMS正規化して加算
-        self._log("ハイブリッドミキシング中...", 88)
-        audio = self._hybrid_mix(synth_audio, stems)
+        # 合成音のみを使用（著作権保護: 元の音源ステムは一切含めない）
+        self._log("マスタリング中...", 88)
+        audio = synth_audio.copy()
 
         # 7. マスタリング
         audio = self._master(audio)
