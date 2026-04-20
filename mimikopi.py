@@ -1519,50 +1519,57 @@ class EarCopyEngine:
     # ---- AI 検出結果 → 15楽器割り当て ----------------------
 
     def _ai_assign_parts(self, vocal_notes, other_notes, bass_notes):
-        """プロアレンジ版: 楽器の重複を最小化し、役割を明確に分離する
-
-        Cubase での耳コピ作業を模倣:
-        - メロディは1楽器に集約（ピアノ）
-        - 伴奏コードは音域で1楽器ずつ担当（ギター or ストリングス）
-        - ベースは専用パート
-        - ダブリングは控えめに（原曲にない楽器は鳴らさない）
-        """
+        """15楽器フルアレンジ: メロディ・伴奏・ベースを豊かな音色で彩る"""
         parts = {name: [] for name in self.MIDI_MAP}
 
-        # === 1. メロディ (ボーカル採譜) → ピアノ主体 ===
-        # ダブリングは控えめ: 高音域だけフルートを薄く重ねる
+        # === 1. メロディ (ボーカル採譜) → ピアノ主体 + ダブリング ===
         for (t, dur, midi, vel) in vocal_notes:
             parts['piano'].append((t, dur, midi, vel))
+            if midi >= 80:
+                parts['flute'].append((t, dur, midi, int(vel * 0.35)))
+            elif midi >= 68:
+                parts['violin'].append((t, dur, midi, int(vel * 0.35)))
+            else:
+                parts['e_piano'].append((t, dur, midi, int(vel * 0.30)))
+            if dur >= 0.8 and 60 <= midi <= 84:
+                parts['trumpet'].append((t, min(dur, 0.5), midi, int(vel * 0.25)))
 
-        # === 2. 伴奏 (other ステム) → 音域で楽器を分離 ===
-        # ポイント: 同時発音するノートは1つの楽器にまとめる
-        # 時間スライスで分類 → コード感を維持
+        # === 2. 伴奏 (other ステム) → 音域・持続時間で多楽器に振り分け ===
         other_sorted = sorted(other_notes, key=lambda x: x[0])
 
         for (t, dur, midi, vel) in other_sorted:
             if midi >= 84:
-                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.85)))
+                parts['glockenspiel'].append((t, dur, midi, int(vel * 0.8)))
+                if dur >= 0.3:
+                    parts['choir'].append((t, dur, midi, int(vel * 0.25)))
             elif midi >= 72:
                 parts['e_piano'].append((t, dur, midi, vel))
+                if dur >= 0.5:
+                    parts['violin'].append((t, dur, midi, int(vel * 0.3)))
             elif midi >= 60:
                 if dur >= 0.5:
                     parts['strings'].append((t, dur, midi, vel))
+                    parts['organ'].append((t, dur, midi, int(vel * 0.25)))
                 else:
                     parts['guitar_clean'].append((t, dur, midi, vel))
             elif midi >= 48:
                 parts['guitar_nylon'].append((t, dur, midi, vel))
+                if dur >= 0.5:
+                    parts['viola'].append((t, dur, midi, int(vel * 0.35)))
             else:
                 parts['cello'].append((t, dur, midi, vel))
 
-        # === 3. ベース → 専用パートのみ（ダブリングなし） ===
+        # === 3. ベース → ベース + チェロオクターブダブリング ===
         for (t, dur, midi, vel) in bass_notes:
             parts['bass'].append((t, dur, midi, vel))
+            if midi + 12 < 60:
+                parts['cello'].append((t, dur, midi + 12, int(vel * 0.40)))
 
-        # === 4. ノート数が少ないパートに pad/choir を控えめ補充 ===
-        # (長い持続音が多い場合のみストリングスをパッドで補強)
+        # === 4. 持続音にパッド/コーラス補強 ===
         long_strings = [(t, dur, m, v) for t, dur, m, v in parts['strings'] if dur >= 1.0]
         for (t, dur, midi, vel) in long_strings:
             parts['pad'].append((t, dur, midi, int(vel * 0.35)))
+            parts['choir'].append((t, dur, midi, int(vel * 0.20)))
 
         # === 5. ポリフォニー制限（位相干渉・音の濁り防止） ===
         MAX_POLY = {'piano': 6, 'e_piano': 4, 'guitar_clean': 4,
