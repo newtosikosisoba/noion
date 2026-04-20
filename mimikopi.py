@@ -802,6 +802,7 @@ class EarCopyEngine:
     CHORD_IV = {
         'maj': [0,4,7], 'min': [0,3,7], 'dom7': [0,4,7,10],
         'min7': [0,3,7,10], 'maj7': [0,4,7,11], 'dim': [0,3,6],
+        'aug': [0,4,8], 'sus4': [0,5,7],
     }
     NOTE_MIDI = {'C':0,'C#':1,'D':2,'D#':3,'E':4,'F':5,
                  'F#':6,'G':7,'G#':8,'A':9,'A#':10,'B':11}
@@ -979,11 +980,14 @@ class EarCopyEngine:
         chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, hop_length=HOP)
         NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
         TEMPLATES = {
-            'maj': [1,0,0,0,1,0,0,1,0,0,0,0],
-            'min': [1,0,0,1,0,0,0,1,0,0,0,0],
-            'dom7':[1,0,0,0,1,0,0,1,0,0,1,0],
-            'min7':[1,0,0,1,0,0,0,1,0,0,1,0],
-            'dim': [1,0,0,1,0,0,1,0,0,0,0,0],
+            'maj':  [1,0,0,0,1,0,0,1,0,0,0,0],
+            'min':  [1,0,0,1,0,0,0,1,0,0,0,0],
+            'dom7': [1,0,0,0,1,0,0,1,0,0,1,0],
+            'min7': [1,0,0,1,0,0,0,1,0,0,1,0],
+            'maj7': [1,0,0,0,1,0,0,1,0,0,0,1],
+            'dim':  [1,0,0,1,0,0,1,0,0,0,0,0],
+            'aug':  [1,0,0,0,1,0,0,0,1,0,0,0],
+            'sus4': [1,0,0,0,0,1,0,1,0,0,0,0],
         }
         beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=HOP)
         events = []
@@ -1494,7 +1498,8 @@ class EarCopyEngine:
             fmax=librosa.note_to_hz("C3"), sr=sr, hop_length=HOP * 2
         )
         times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=HOP * 2)
-        return self._f0_to_notes(f0, voiced, times, 4)
+        rms = librosa.feature.rms(y=audio, frame_length=HOP * 4, hop_length=HOP * 2)[0]
+        return self._f0_to_notes(f0, voiced, times, 4, rms)
 
     # ---- ドラム (Demucs ドラムステム直接解析) --------------
 
@@ -1517,14 +1522,19 @@ class EarCopyEngine:
             freqs = np.fft.rfftfreq(len(seg), 1 / sr)
             tot = fft.sum() + 1e-9
             lo = fft[freqs < 120].sum() / tot
+            mid_lo = fft[(freqs >= 120) & (freqs < 200)].sum() / tot
             mid = fft[(freqs >= 200) & (freqs < 1500)].sum() / tot
             hi = fft[freqs >= 3000].sum() / tot
             if lo > 0.45:
                 kind = "kick"
-            elif hi > 0.45:
+            elif hi > 0.55:
                 kind = "hihat"
+            elif hi > 0.35 and mid < 0.2:
+                kind = "open_hat"
             elif mid > 0.3 and hi > 0.15:
                 kind = "ride"
+            elif mid_lo > 0.25 and lo < 0.35:
+                kind = "tom"
             else:
                 kind = "snare"
             peak = float(np.max(np.abs(seg))) if len(seg) else 0.0
@@ -1538,15 +1548,28 @@ class EarCopyEngine:
         """15楽器フルアレンジ: メロディ・伴奏・ベースを豊かな音色で彩る"""
         parts = {name: [] for name in self.MIDI_MAP}
 
+        # ステムごとの相対エネルギーからダブリング倍率を動的に算出
+        def _stem_energy(notes, ref=0.7):
+            if not notes:
+                return ref
+            vels = np.array([v for _, _, _, v in notes], dtype=np.float32)
+            return float(np.clip(np.percentile(vels, 75) / 100.0, 0.2, 1.4))
+
+        v_energy = _stem_energy(vocal_notes)
+        inv_v = 1.0 / max(v_energy, 0.5)
+        flute_scale = float(np.clip(0.35 * inv_v, 0.15, 0.55))
+        violin_scale = float(np.clip(0.35 * inv_v, 0.15, 0.45))
+        epiano_scale = float(np.clip(0.30 * inv_v, 0.12, 0.40))
+
         # === 1. メロディ (ボーカル採譜) → ピアノ主体 + ダブリング ===
         for (t, dur, midi, vel) in vocal_notes:
             parts['piano'].append((t, dur, midi, vel))
             if midi >= 80:
-                parts['flute'].append((t, dur, midi, int(vel * 0.35)))
+                parts['flute'].append((t, dur, midi, int(vel * flute_scale)))
             elif midi >= 68:
-                parts['violin'].append((t, dur, midi, int(vel * 0.35)))
+                parts['violin'].append((t, dur, midi, int(vel * violin_scale)))
             else:
-                parts['e_piano'].append((t, dur, midi, int(vel * 0.30)))
+                parts['e_piano'].append((t, dur, midi, int(vel * epiano_scale)))
             if dur >= 0.8 and 60 <= midi <= 84:
                 parts['trumpet'].append((t, min(dur, 0.5), midi, int(vel * 0.25)))
 
@@ -1723,29 +1746,23 @@ class EarCopyEngine:
             return None, "unknown"
 
     def _scale_snap_notes(self, notes, scale_set):
-        """スケール外ノートを隣接スケール音へ弱スナップ（±1半音のみ）。
-        短いノート（経過音・装飾音の可能性）はスナップせず元の個性を保持する。"""
+        """スケール外ノートを最寄りスケール音へスナップ（±2半音以内を検索）。
+        短いノート（経過音・装飾音の可能性）はスナップせず原音の個性を保持する。"""
         if not notes or not scale_set:
             return notes
         snapped = []
         for (t, dur, midi, vel) in notes:
             pc = int(midi) % 12
-            # 持続時間が短い（0.2秒未満）ノートは経過音として尊重
-            if dur < 0.2:
+            if dur < 0.35 or pc in scale_set:
                 snapped.append((t, dur, midi, vel))
                 continue
-            if pc in scale_set:
-                snapped.append((t, dur, midi, vel))
-                continue
-            up_in = ((pc + 1) % 12) in scale_set
-            down_in = ((pc - 1) % 12) in scale_set
-            if down_in and not up_in:
-                snapped.append((t, dur, midi - 1, vel))
-            elif up_in and not down_in:
-                snapped.append((t, dur, midi + 1, vel))
-            elif up_in and down_in:
-                # 両隣ともスケール内 → 下へ（短調っぽさを残す）
-                snapped.append((t, dur, midi - 1, vel))
+            best_delta = None
+            for delta in [-1, 1, -2, 2]:
+                if (pc + delta) % 12 in scale_set:
+                    best_delta = delta
+                    break
+            if best_delta is not None:
+                snapped.append((t, dur, midi + best_delta, vel))
             else:
                 snapped.append((t, dur, midi, vel))
         return snapped
@@ -1768,6 +1785,13 @@ class EarCopyEngine:
                     audio = (audio * 0.80 + boosted * 0.20).astype(np.float32)
             except Exception:
                 pass
+            # M/S ステレオ幅拡張: FluidSynth の狭いステレオイメージを広げる
+            if audio.ndim == 2 and audio.shape[1] == 2:
+                mid  = (audio[:, 0] + audio[:, 1]) * 0.5
+                side = (audio[:, 0] - audio[:, 1]) * 0.5
+                side *= 1.4
+                audio[:, 0] = mid + side
+                audio[:, 1] = mid - side
             return audio * 0.90
         self._log("  FluidSynth 未使用、v6加算合成を使用", 84)
         n = int((duration + 2.0) * SR)
@@ -1837,9 +1861,9 @@ class EarCopyEngine:
                 "-ni",
                 "-F", str(ascii_wav),
                 "-r", str(SR),
-                "-g", "0.9",
-                "-R", "1",
-                "-C", "1",
+                "-g", "0.85",
+                "-R", "0",
+                "-C", "0",
                 "-T", "wav",
             ]
             if use_file_driver:
@@ -1980,13 +2004,16 @@ class EarCopyEngine:
         # DC オフセット除去
         audio = (audio - np.mean(audio, axis=0)).astype(np.float32)
 
-        # 軽いルームリバーブで空間感を統一（合成音と原ステムを馴染ませる）
+        # 軽いルームリバーブで空間感を統一（L/Rは23サンプルずらしてデコリレーション）
         try:
             if is_stereo:
-                for ch in range(audio.shape[1]):
-                    audio[:, ch] = self._reverb_signal(
-                        audio[:, ch], room_size=0.35, wet=0.06
-                    )
+                audio[:, 0] = self._reverb_signal(
+                    audio[:, 0], room_size=0.35, wet=0.06
+                )
+                shifted = np.pad(audio[:, 1], (23, 0))[:len(audio)]
+                audio[:, 1] = self._reverb_signal(
+                    shifted, room_size=0.35, wet=0.06
+                )
             else:
                 audio = self._reverb_signal(audio, room_size=0.35, wet=0.06)
         except Exception:
@@ -2010,7 +2037,7 @@ class EarCopyEngine:
         else:
             audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # エンベロープフォロワー付きコンプレッサー（リンクドステレオ）
+        # RMSベース エンベロープフォロワー付きコンプレッサー（リンクドステレオ）
         threshold = 0.3
         ratio = 2.5
         attack = np.exp(-1 / (SR * 0.005))
@@ -2018,33 +2045,39 @@ class EarCopyEngine:
         env = 0.0
         n_samples = len(audio)
         gain_arr = np.ones(n_samples, dtype=np.float32)
-        block = 32
+        block = 256
         for i in range(0, n_samples - block, block):
             chunk = audio[i:i + block]
-            peak = float(np.max(np.abs(chunk)))
-            if peak > env:
-                env = attack * env + (1 - attack) * peak
+            rms_val = float(np.sqrt(np.mean(chunk ** 2) + 1e-12))
+            if rms_val > env:
+                env = attack * env + (1 - attack) * rms_val
             else:
-                env = release * env + (1 - release) * peak
+                env = release * env + (1 - release) * rms_val
             if env > threshold:
                 desired_gain = (threshold + (env - threshold) / ratio) / max(env, 1e-9)
             else:
                 desired_gain = 1.0
             gain_arr[i:i + block] = desired_gain
-        # メイクアップゲイン: 圧縮で失った音量を補償（3dB 程度）
-        makeup = 10 ** (3.0 / 20.0)  # +3dB
+        # 動的メイクアップゲイン: 実際の圧縮量に応じて補償
+        avg_gain = float(np.mean(gain_arr))
+        if avg_gain > 1e-9:
+            makeup_db = max(0.0, min(6.0, -20 * np.log10(avg_gain)))
+        else:
+            makeup_db = 3.0
+        makeup = 10 ** (makeup_db / 20.0)
         gain_arr *= makeup
         if is_stereo:
             audio *= gain_arr[:, np.newaxis]
         else:
             audio *= gain_arr
 
-        # ノーマライズ + ソフトクリップ (歪み軽減のため控えめに)
+        # ノーマライズ + ソフトニーリミッター
         peak = np.max(np.abs(audio))
         if peak > 0:
-            audio = audio / peak * 0.92
-        # 緩やかなtanh: ピーク 0.92 → tanh(0.92*0.85)*0.98 ≈ 0.63 → 自然なサチュレーション
-        audio = np.tanh(audio * 0.85) * 0.98
+            audio = audio / peak * 0.94
+        audio = np.where(np.abs(audio) > 0.90,
+            np.sign(audio) * (0.90 + np.tanh((np.abs(audio) - 0.90) * 4) * 0.04),
+            audio).astype(np.float32)
         return audio.astype(np.float32)
 
     def _validate_output(self, audio, duration):
@@ -2109,11 +2142,23 @@ class EarCopyEngine:
 
     def _tempo(self, y, sr):
         self._log("テンポ・リズム解析中...", 18)
-        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP)
+        # テンポグラムで候補BPMを推定し、音楽的に一般的な範囲(60-180)に補正
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP,
+                                                  aggregate=np.median)
+        tempo_candidates = librosa.beat.tempo(onset_envelope=onset_env, sr=sr,
+                                               hop_length=HOP)
+        start_bpm = float(np.atleast_1d(tempo_candidates)[0])
+        if start_bpm > 200:
+            start_bpm /= 2.0
+        elif start_bpm < 50:
+            start_bpm *= 2.0
+
+        tempo, beats = librosa.beat.beat_track(
+            onset_envelope=onset_env, sr=sr, hop_length=HOP,
+            start_bpm=start_bpm, tightness=100
+        )
         beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=HOP)
-        # librosa 0.10+ では tempo が配列で返る場合があるため先頭要素を取得
         tempo_val = float(np.atleast_1d(tempo)[0])
-        # テンポが検出できなかった場合は120BPMをデフォルトとする
         if tempo_val <= 0:
             tempo_val = 120.0
         return tempo_val, beat_times
@@ -2136,17 +2181,24 @@ class EarCopyEngine:
             freqs = np.fft.rfftfreq(len(seg), 1 / sr)
             tot = fft.sum() + 1e-9
             lo = fft[freqs < 120].sum() / tot
+            mid_lo = fft[(freqs >= 120) & (freqs < 200)].sum() / tot
             mid = fft[(freqs >= 200) & (freqs < 1500)].sum() / tot
             hi = fft[freqs >= 3000].sum() / tot
             if lo > 0.45:
                 kind = 'kick'
-            elif hi > 0.4:
+            elif hi > 0.55:
                 kind = 'hihat'
-            elif mid > 0.35 and hi > 0.15:
+            elif hi > 0.35 and mid < 0.2:
+                kind = 'open_hat'
+            elif mid > 0.3 and hi > 0.15:
                 kind = 'ride'
+            elif mid_lo > 0.25 and lo < 0.35:
+                kind = 'tom'
             else:
                 kind = 'snare'
-            events.append((ot, kind))
+            peak = float(np.max(np.abs(seg))) if len(seg) else 0.0
+            vel = int(np.clip(60 + peak * 120, 40, 127))
+            events.append((ot, kind, vel))
         return events
 
     # ---- v7.0 物理モデリングシンセサイザー ====================
@@ -2214,15 +2266,15 @@ class EarCopyEngine:
         return _lf(b, a, saw)
 
     def _reverb_signal(self, signal, room_size=0.65, wet=0.18):
-        """Schroeder リバーブ (4comb + 2allpass, lfilter 高速実装)"""
+        """Freeverb風 Schroeder リバーブ (4comb + 2allpass, lfilter 高速実装)"""
         from scipy.signal import lfilter as _lf
         comb_params = [
-            (int(0.0297 * SR), room_size * 0.93),
-            (int(0.0371 * SR), room_size * 0.91),
-            (int(0.0411 * SR), room_size * 0.88),
-            (int(0.0437 * SR), room_size * 0.86),
+            (1557, room_size * 0.93),
+            (1617, room_size * 0.91),
+            (1491, room_size * 0.88),
+            (1422, room_size * 0.86),
         ]
-        tail = int(SR * 0.4)
+        tail = int(SR * 0.6)
         padded = np.zeros(len(signal) + tail)
         padded[:len(signal)] = signal
 
@@ -2234,7 +2286,7 @@ class EarCopyEngine:
             reverbed += _lf(np.array([1.0]), a, padded)
         reverbed /= len(comb_params)
 
-        allpass_params = [(int(0.005 * SR), 0.5), (int(0.0017 * SR), 0.5)]
+        allpass_params = [(int(0.089 * SR), 0.5), (int(0.006 * SR), 0.5)]
         for delay, gain in allpass_params:
             b = np.zeros(delay + 1)
             b[0] = -gain
@@ -2245,7 +2297,14 @@ class EarCopyEngine:
             reverbed = _lf(b, a, reverbed)
 
         n = len(signal)
-        return ((1 - wet) * signal + wet * reverbed[:n]).astype(np.float32)
+        # サブベースのリバーブ除去（150Hz以下は残響させない）
+        try:
+            nyq = SR / 2
+            b_hp, a_hp = butter(2, 150 / nyq, btype='high')
+            wet_sig = filtfilt(b_hp, a_hp, reverbed[:n]).astype(np.float32)
+        except Exception:
+            wet_sig = reverbed[:n].astype(np.float32)
+        return ((1 - wet) * signal + wet * wet_sig).astype(np.float32)
 
     # ---- 15楽器 物理モデリング音色 ==========================
 
@@ -2502,6 +2561,16 @@ class EarCopyEngine:
             n_ = np.random.randn(len(t))
             b, a = butter(3, min(6000 / (SR / 2), 0.99), btype='high')
             return filtfilt(b, a, n_) * np.exp(-t * 70) * 0.35
+        elif kind == 'open_hat':
+            t = self._t(0.18 * scale)
+            n_ = np.random.randn(len(t))
+            b, a = butter(3, min(5000 / (SR / 2), 0.99), btype='high')
+            return filtfilt(b, a, n_) * np.exp(-t * 20) * 0.32
+        elif kind == 'tom':
+            t = self._t(0.25 * scale)
+            sweep = 120 * np.exp(-t * 15) + 60
+            sig = np.sin(2 * np.pi * np.cumsum(sweep) / SR) * np.exp(-t * 12)
+            return sig * 0.65
         else:
             t = self._t(0.12 * scale)
             n_ = np.random.randn(len(t))
@@ -2606,7 +2675,8 @@ class EarCopyEngine:
             mid.tracks.append(trk)
 
         # ドラムトラック (ch9)
-        DM = {'kick': 36, 'snare': 38, 'hihat': 42, 'ride': 51}
+        DM = {'kick': 36, 'snare': 38, 'hihat': 42, 'open_hat': 46,
+              'ride': 51, 'tom': 47}
         devs = []
         # ドラム初期設定
         devs.append((0, Message('control_change', channel=9, control=7, value=105, time=0)))  # Vol
@@ -2618,7 +2688,8 @@ class EarCopyEngine:
             if len(evt) > 2:
                 dv = int(np.clip(evt[2], 1, 127))
             else:
-                dv = {'kick': 105, 'snare': 100, 'hihat': 75, 'ride': 70}.get(kind, 90)
+                dv = {'kick': 105, 'snare': 100, 'hihat': 75, 'open_hat': 80,
+                      'ride': 70, 'tom': 95}.get(kind, 90)
             n = DM.get(kind, 38)
             t0 = s2t(t)
             devs.append((t0, Message('note_on', channel=9, note=n, velocity=dv, time=0)))
