@@ -810,8 +810,129 @@ class EarCopyEngine:
     def __init__(self, on_progress=None, mode="ai"):
         self._cb = on_progress
         self.mode = mode  # "ai" | "ai_inst" | "karaoke" | "classic"
+        # 採譜精度モード: "high_recall" | "balanced" | "high_precision"
+        self.transcription_quality = "balanced"
 
     def _log(self, msg, pct=None):
+        if self._cb:
+            self._cb(msg, pct)
+        else:
+            print(f"[{pct or '--':>3}%] {msg}")
+
+    # ---- 採譜パラメータ設定 -----------------------------------
+
+    def _get_transcription_cfg(self):
+        """採譜モード別の閾値セットを返す。
+        high_recall:    短音・弱音を逃さない（誤検出は増える）
+        balanced:       デフォルト。再現率と精度のバランス
+        high_precision: 確信度の高いノートのみ（取りこぼしは増える）
+        """
+        cfgs = {
+            'high_recall': {
+                'onset_threshold': 0.25, 'onset_threshold_vocal': 0.28,
+                'frame_threshold': 0.18, 'frame_threshold_vocal': 0.20,
+                'min_note_ms': 28, 'min_note_ms_vocal': 32,
+                'freq_min_vocal': 70.0, 'freq_max_vocal': 2800.0,
+                'freq_min': 28.0, 'freq_max': 6000.0,
+                'cqt_thr_delta': 15.0, 'cqt_thr_min': 1.0,
+                'dur_floor_s': 0.03,
+            },
+            'balanced': {
+                'onset_threshold': 0.35, 'onset_threshold_vocal': 0.35,
+                'frame_threshold': 0.25, 'frame_threshold_vocal': 0.27,
+                'min_note_ms': 40, 'min_note_ms_vocal': 45,
+                'freq_min_vocal': 80.0, 'freq_max_vocal': 2400.0,
+                'freq_min': 32.0, 'freq_max': 5000.0,
+                'cqt_thr_delta': 18.0, 'cqt_thr_min': 1.5,
+                'dur_floor_s': 0.04,
+            },
+            'high_precision': {
+                'onset_threshold': 0.50, 'onset_threshold_vocal': 0.55,
+                'frame_threshold': 0.35, 'frame_threshold_vocal': 0.38,
+                'min_note_ms': 60, 'min_note_ms_vocal': 70,
+                'freq_min_vocal': 90.0, 'freq_max_vocal': 2000.0,
+                'freq_min': 40.0, 'freq_max': 4000.0,
+                'cqt_thr_delta': 20.0, 'cqt_thr_min': 2.0,
+                'dur_floor_s': 0.06,
+            },
+        }
+        return cfgs.get(self.transcription_quality, cfgs['balanced'])
+
+    # ---- ステム別前処理 ----------------------------------------
+
+    def _preprocess_stem(self, audio, sr, stem_type):
+        """ステムタイプごとに最適な前処理（正規化 + 帯域EQ）を行う。
+        採譜精度向上のための純粋な信号処理。元音源は出力に使わない。
+        """
+        if audio is None or np.max(np.abs(audio)) < 1e-6:
+            return audio
+        # RMS 正規化: 採譜ライブラリの感度を均一化
+        rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+        if rms > 1e-8:
+            audio = audio / rms * 0.20
+        nyq = sr / 2
+        try:
+            if stem_type == 'vocals':
+                # ボーカル: 80Hz–8kHz バンドパス（ルーム・サブノイズ除去）
+                b, a = butter(4, [min(80 / nyq, 0.99), min(8000 / nyq, 0.99)], btype='band')
+                audio = filtfilt(b, a, audio).astype(np.float32)
+            elif stem_type == 'other':
+                # 伴奏: HPSS でハーモニック成分を強調（CQT精度向上）
+                audio, _ = librosa.effects.hpss(audio, margin=2.0)
+            elif stem_type == 'bass':
+                # ベース: 300Hz ローパス（中高音ブリードを除去）
+                b, a = butter(4, min(300 / nyq, 0.99), btype='low')
+                audio = filtfilt(b, a, audio).astype(np.float32)
+        except Exception:
+            pass
+        return np.clip(audio, -1.0, 1.0).astype(np.float32)
+
+    # ---- MIDI 統計ログ -----------------------------------------
+
+    def _log_midi_stats(self, label, notes):
+        """採譜結果の診断ログを出力する。"""
+        if not notes:
+            self._log(f"  [{label}] ノートなし", -1)
+            return
+        durs = np.array([d for _, d, _, _ in notes], dtype=np.float32)
+        vels = np.array([v for _, _, _, v in notes], dtype=np.float32)
+        short_cnt = int(np.sum(durs < 0.10))
+        clip_cnt = int(np.sum(vels >= 127))
+        total = len(notes)
+        self._log(
+            f"  [{label}] {total}音符 | 平均長{np.mean(durs):.2f}s"
+            f" | 短音{short_cnt}個({100*short_cnt//total}%)"
+            f" | クリップ{clip_cnt}個({100*clip_cnt//total}%)",
+            -1,
+        )
+
+    # ---- 重複・オーバーラップ ノート除去 -----------------------
+
+    def _remove_overlapping_notes(self, notes):
+        """同一ピッチで時間的に重なるノートを統合または末端カットする。
+        同ピッチが再開始(onset)される場合は前ノートを直前で打ち切る。
+        """
+        if not notes:
+            return notes
+        by_pitch = {}
+        for note in notes:
+            t, dur, midi, vel = note
+            by_pitch.setdefault(midi, []).append(note)
+        result = []
+        for midi, group in by_pitch.items():
+            group = sorted(group, key=lambda x: x[0])
+            cleaned = []
+            for i, (t, dur, m, v) in enumerate(group):
+                if cleaned:
+                    prev_t, prev_dur, prev_m, prev_v = cleaned[-1]
+                    overlap_end = prev_t + prev_dur
+                    if t < overlap_end:
+                        # 前ノートを今のノート開始直前でカット
+                        new_dur = max(0.02, t - prev_t)
+                        cleaned[-1] = (prev_t, new_dur, prev_m, prev_v)
+                cleaned.append((t, dur, m, v))
+            result.extend(cleaned)
+        return sorted(result, key=lambda x: x[0])
         if self._cb:
             self._cb(msg, pct)
         else:
@@ -820,8 +941,13 @@ class EarCopyEngine:
     # ---- 高精度CQT多声部検出 v5 ----------------------------
 
     def _detect_all_notes(self, y_h, sr):
-        """CQT + オンセット同期 + 適応スレッショルド + 倍音除去"""
+        """CQT + オンセット同期 + 適応スレッショルド + 強度比ベース倍音除去"""
         from scipy.ndimage import median_filter, uniform_filter1d
+
+        cfg = self._get_transcription_cfg()
+        dur_floor = cfg['dur_floor_s']
+        thr_delta = cfg['cqt_thr_delta']
+        thr_min = cfg['cqt_thr_min']
 
         self._log("  CQT解析中...", 26)
         n_bins = 84
@@ -844,9 +970,11 @@ class EarCopyEngine:
         # オンセット検出（ノートの開始タイミングを正確に）
         self._log("  オンセット検出中...", 30)
         onset_env = librosa.onset.onset_strength(y=y_h, sr=sr, hop_length=HOP)
-        onsets_fr = librosa.onset.onset_detect(y=y_h, sr=sr, hop_length=HOP,
-                                                onset_envelope=onset_env,
-                                                backtrack=True)
+        onsets_fr = librosa.onset.onset_detect(
+            y=y_h, sr=sr, hop_length=HOP,
+            onset_envelope=onset_env,
+            backtrack=True,
+        )
         onset_set = set(onsets_fr.tolist())
 
         # 適応スレッショルド: 各フレームの上位N%をノートとみなす
@@ -855,9 +983,8 @@ class EarCopyEngine:
         events = []
         for fi in range(C_sm.shape[1]):
             frame = C_sm[:, fi]
-            # 適応閾値: フレーム内の最大値から相対的に決定
             frame_max = np.max(frame)
-            thr = max(frame_max - 18, 1.5)  # 最大値から18dB以内 + 最低1.5dB超え（感度向上）
+            thr = max(frame_max - thr_delta, thr_min)
 
             on_now = set()
             peaks = []
@@ -866,23 +993,24 @@ class EarCopyEngine:
                         frame[bi] >= frame[bi-1] and frame[bi] >= frame[bi+1]):
                     peaks.append((bi, frame[bi]))
 
-            # 倍音除去: 低い音が強い場合、その倍音を除去
+            # 強度比ベース倍音除去:
+            # 候補ノートを強度順にソートし、既検出音の倍音かつ
+            # 強度が基音の 50% 未満なら除去（正当な高音コードは保持）
             if peaks:
                 peaks.sort(key=lambda x: x[1], reverse=True)
                 kept = []
-                used_midi = set()
+                kept_energy = {}  # midi -> energy
                 for bi, en in peaks:
                     mn = int(midi_notes[bi])
-                    # 既に検出済み音の倍音(+12,+19,+24,+28,+31半音)かチェック
                     is_harmonic = False
-                    for km in used_midi:
+                    for km, ke in kept_energy.items():
                         diff = mn - km
-                        if diff in (12, 19, 24, 28, 31):
+                        if diff in (12, 19, 24, 28, 31) and en < ke * 0.5:
                             is_harmonic = True
                             break
                     if not is_harmonic:
                         kept.append((bi, en, mn))
-                        used_midi.add(mn)
+                        kept_energy[mn] = en
                 for bi, en, mn in kept:
                     on_now.add(mn)
                     if mn not in active:
@@ -896,13 +1024,13 @@ class EarCopyEngine:
                 if mn not in on_now:
                     sf_, mx, has_onset = active.pop(mn)
                     dur = times[min(fi, len(times)-1)] - times[sf_]
-                    if dur >= 0.04:
+                    if dur >= dur_floor:
                         vel = int(np.clip(mx * 3.5 + 30, 35, 127))
                         events.append((times[sf_], dur, mn, vel))
 
         for mn, (sf_, mx, has_onset) in active.items():
             dur = times[-1] - times[sf_]
-            if dur >= 0.04:
+            if dur >= dur_floor:
                 vel = int(np.clip(mx * 3.5 + 30, 35, 127))
                 events.append((times[sf_], dur, mn, vel))
         return events
@@ -1201,24 +1329,32 @@ class EarCopyEngine:
         if scale_set is not None:
             self._log(f"  推定キー: {scale_name}", 30)
 
+        tq = getattr(self, 'transcription_quality', 'balanced')
+        self._log(f"採譜モード: {tq}", 30)
+
         skip_vocal = (self.mode == "ai_inst")
         if skip_vocal:
             self._log("ガイドメロディなしモード: ボーカル採譜をスキップ", 32)
             vocal_notes = []
         else:
             self._log("ボーカルを多声部採譜中 (Basic Pitch)...", 32)
-            vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
-            self._log(f"  ボーカル: {len(vocal_notes)} 音符", 45)
+            vocal_stem = self._preprocess_stem(stems["vocals"], sr, 'vocals')
+            vocal_notes = self._basic_pitch_notes(vocal_stem, sr, is_vocal=True)
+            vocal_notes = self._remove_overlapping_notes(vocal_notes)
+            self._log_midi_stats("ボーカル採譜結果", vocal_notes)
             if scale_set is not None:
                 vocal_notes = self._scale_snap_notes(vocal_notes, scale_set)
 
         self._log("その他楽器を多声部採譜中 (Basic Pitch)...", 50)
-        other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
-        self._log(f"  その他: {len(other_notes)} 音符", 58)
+        other_stem = self._preprocess_stem(stems["other"], sr, 'other')
+        other_notes = self._basic_pitch_notes(other_stem, sr, is_vocal=False)
+        other_notes = self._remove_overlapping_notes(other_notes)
+        self._log_midi_stats("その他採譜結果", other_notes)
 
         self._log("ベースライン採譜中 (pyin)...", 62)
-        bass_notes = self._pyin_bass_notes(stems["bass"], sr)
-        self._log(f"  ベース: {len(bass_notes)} 音符", 68)
+        bass_stem = self._preprocess_stem(stems["bass"], sr, 'bass')
+        bass_notes = self._pyin_bass_notes(bass_stem, sr)
+        self._log_midi_stats("ベース採譜結果", bass_notes)
 
         self._log("ドラム採譜中...", 70)
         drum_events = self._drums_from_stem(stems["drums"], sr)
@@ -1421,15 +1557,31 @@ class EarCopyEngine:
             tmp = f.name
         try:
             sf.write(tmp, audio_22k, target_sr)
+            cfg = self._get_transcription_cfg()
             try:
                 _, _, note_events = predict(
                     tmp,
                     model_or_model_path=str(ICASSP_2022_MODEL_PATH),
-                    onset_threshold=0.35,  # 一律低め: 微小なアタックも拾う
-                    frame_threshold=0.27 if is_vocal else 0.25,  # フレーム連続性も緩め
-                    minimum_note_length=45 if is_vocal else 40,  # 短いパッセージも許容
-                    minimum_frequency=80.0 if is_vocal else 32.0,
-                    maximum_frequency=2400.0 if is_vocal else 5000.0,
+                    onset_threshold=(
+                        cfg['onset_threshold_vocal'] if is_vocal
+                        else cfg['onset_threshold']
+                    ),
+                    frame_threshold=(
+                        cfg['frame_threshold_vocal'] if is_vocal
+                        else cfg['frame_threshold']
+                    ),
+                    minimum_note_length=(
+                        cfg['min_note_ms_vocal'] if is_vocal
+                        else cfg['min_note_ms']
+                    ),
+                    minimum_frequency=(
+                        cfg['freq_min_vocal'] if is_vocal
+                        else cfg['freq_min']
+                    ),
+                    maximum_frequency=(
+                        cfg['freq_max_vocal'] if is_vocal
+                        else cfg['freq_max']
+                    ),
                     melodia_trick=is_vocal,
                     midi_tempo=120,
                 )
@@ -1653,7 +1805,7 @@ class EarCopyEngine:
 
         quantized = []
         for (t, dur, midi, vel) in notes:
-            # 短い装飾音はグリッドに寄せない（原音のニュアンス保持）
+            # 短い装飾音・経過音はグリッドに寄せない（原音のニュアンス保持）
             if dur < 0.1:
                 quantized.append((t, dur, midi, vel))
                 continue
@@ -1663,12 +1815,15 @@ class EarCopyEngine:
             if dist > grid_step * 0.4:
                 qt = t  # グリッドから遠い→自然なタイミングを保持
             elif dist > grid_step * 0.15:
-                qt = t + (qt - t) * 0.25  # 中距離→25%だけスナップ（より自然）
+                qt = t + (qt - t) * 0.25  # 中距離→25%だけスナップ
             else:
-                qt = t + (qt - t) * 0.6  # 近距離も完全スナップせず60%だけ
-            # durationは元の長さを尊重（軽い丸めのみ）
-            qdur = max(round(dur / grid_step) * grid_step, grid_step * 0.5)
-            qdur = min(qdur, dur * 1.3)
+                qt = t + (qt - t) * 0.6  # 近距離も完全スナップせず60%
+            # duration は元を尊重: 1グリッド未満の短音は絶対に膨らませない
+            if dur < grid_step:
+                qdur = dur  # そのまま保持
+            else:
+                qdur = max(round(dur / grid_step) * grid_step, grid_step)
+                qdur = min(qdur, dur * 1.2)  # 1.3→1.2 で過膨張を抑制
             quantized.append((qt, qdur, midi, vel))
 
         # 同一時刻・同一ピッチの重複除去（loudest 優先）
