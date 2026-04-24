@@ -1,0 +1,30 @@
+# =====================================================
+# mimikopi 依存パッケージ
+# =====================================================
+# 注: mimikopi.py は起動時に自動インストールを行うため、
+# このファイルは手動インストール / Docker / CI 向け。
+
+# --- コアパッケージ (mimikopi.py 本体) ---
+numpy>=1.21
+librosa>=0.9
+soundfile>=0.10
+scipy>=1.7
+mido>=1.2
+pydub>=0.25
+
+# --- MIDI 出力改善 (⑤ export_midi で使用) ---
+pretty_midi>=0.2.9
+
+# --- リアルタイム処理 (⑥⑦ realtime.py) ---
+sounddevice>=0.4
+python-rtmidi>=1.4
+
+# --- Web API (⑧ api.py) ---
+fastapi>=0.100
+uvicorn[standard]>=0.20
+python-multipart>=0.0.6
+
+# --- AI 推論 (mimikopi.py が遅延インストール、任意) ---
+# torch>=2.0
+# demucs>=4.0
+# basic-pitch[onnx]>=0.2

@@ -3590,6 +3590,291 @@ def _run_cli(args):
 
 
 # =====================================================
+# 追加モジュール: 特徴量抽出 / 後処理 / MIDI出力 / 分離推論
+# =====================================================
+# 既存 EarCopyEngine のメソッドと独立して外部からも利用可能な
+# スタンドアロン関数・クラス群。既存コードは一切変更しない。
+
+import logging as _logging
+
+_mod_logger = _logging.getLogger("mimikopi.ext")
+
+
+class FeatureExtractor:
+    """Mel + CQT + Chroma を結合した特徴量を返す。
+
+    既存 EarCopyEngine の個別解析（_detect_all_notes, _estimate_key 等）と
+    独立して利用可能。モデル学習やリアルタイム推論の入力として使う想定。
+
+    変更理由: ②特徴量強化 — 単一特徴量ではなく3種を結合して表現力を高める。
+    CPU動作前提、GPU依存なし。
+    """
+
+    def __init__(self, sr=44100, hop_length=512,
+                 n_mels=128, n_cqt_bins=84, n_chroma=12):
+        self.sr = sr
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.n_cqt_bins = n_cqt_bins
+        self.n_chroma = n_chroma
+
+    @property
+    def feature_dim(self):
+        """結合後の特徴次元数 (n_mels + n_cqt_bins + n_chroma)"""
+        return self.n_mels + self.n_cqt_bins + self.n_chroma
+
+    def extract(self, y):
+        """音声 ndarray → 結合特徴量 (T, feature_dim)
+
+        Args:
+            y: 1D float32 ndarray (モノラル音声)
+        Returns:
+            np.ndarray shape (T, feature_dim) — T はフレーム数
+        """
+        feats = []
+
+        # --- Mel スペクトログラム ---
+        try:
+            mel = librosa.feature.melspectrogram(
+                y=y, sr=self.sr, hop_length=self.hop_length,
+                n_mels=self.n_mels, fmax=8000)
+            mel_db = librosa.power_to_db(mel, ref=np.max)
+            feats.append(mel_db)
+        except Exception as e:
+            _mod_logger.warning("Mel extraction failed: %s", e)
+            feats.append(np.zeros((self.n_mels, 1)))
+
+        # --- CQT (Constant-Q Transform) ---
+        try:
+            cqt = np.abs(librosa.cqt(
+                y=y, sr=self.sr, hop_length=self.hop_length,
+                n_bins=self.n_cqt_bins, bins_per_octave=12,
+                fmin=librosa.note_to_hz('C1')))
+            cqt_db = librosa.amplitude_to_db(cqt, ref=np.max)
+            feats.append(cqt_db)
+        except Exception as e:
+            _mod_logger.warning("CQT extraction failed: %s", e)
+            feats.append(np.zeros((self.n_cqt_bins, 1)))
+
+        # --- Chroma (CQT ベース) ---
+        try:
+            chroma = librosa.feature.chroma_cqt(
+                y=y, sr=self.sr, hop_length=self.hop_length,
+                n_chroma=self.n_chroma)
+            feats.append(chroma)
+        except Exception as e:
+            _mod_logger.warning("Chroma extraction failed: %s", e)
+            feats.append(np.zeros((self.n_chroma, 1)))
+
+        # フレーム数を最大に揃えて結合
+        T = max(f.shape[1] for f in feats)
+        aligned = []
+        for f in feats:
+            if f.shape[1] < T:
+                f = np.pad(f, ((0, 0), (0, T - f.shape[1])), mode='edge')
+            elif f.shape[1] > T:
+                f = f[:, :T]
+            aligned.append(f)
+        combined = np.concatenate(aligned, axis=0)  # (feature_dim, T)
+        return combined.T  # (T, feature_dim)
+
+
+def postprocess_notes(notes, tempo=120.0, min_dur=0.04,
+                      gap_fill=0.03, grid_snap=True):
+    """ノートリストに標準後処理を適用するスタンドアロン関数。
+
+    変更理由: ④後処理追加 — EarCopyEngine 内部の _refine_notes / _rebuild_rhythm
+    を外部から単独で利用できるようラップ。
+
+    Args:
+        notes    : [(onset_s, dur_s, midi, vel), ...]
+        tempo    : BPM
+        min_dur  : これ未満のノートを削除（秒）
+        gap_fill : 同ピッチ間ギャップをこれ以下なら結合（秒）
+        grid_snap: 16分音符グリッドへの軽量スナップ
+    Returns:
+        [(onset_s, dur_s, midi, vel), ...]
+    """
+    if not notes:
+        return notes
+    _mod_logger.debug("postprocess_notes: input %d notes", len(notes))
+
+    # 1. 短音削除
+    notes = [(t, d, m, v) for t, d, m, v in notes if d >= min_dur]
+
+    # 2. 同ピッチのギャップ補完（レガート接続）
+    by_pitch = {}
+    for n in notes:
+        by_pitch.setdefault(n[2], []).append(list(n))
+    result = []
+    for midi, group in by_pitch.items():
+        group = sorted(group, key=lambda x: x[0])
+        for i in range(len(group) - 1):
+            t, d, m, v = group[i]
+            t_next = group[i + 1][0]
+            gap = t_next - (t + d)
+            if 0 < gap <= gap_fill:
+                group[i] = [t, d + gap * 0.9, m, v]
+        result.extend(tuple(g) for g in group)
+    notes = sorted(result, key=lambda x: x[0])
+
+    # 3. 16分音符グリッドスナップ（50ms以内のみ、40%強度）
+    if grid_snap and tempo > 0:
+        beat_dur = 60.0 / max(tempo, 40)
+        grid_step = beat_dur / 4
+        snapped = []
+        for (t, d, m, v) in notes:
+            nearest = round(t / grid_step) * grid_step
+            if abs(nearest - t) <= 0.05:
+                t = t + (nearest - t) * 0.4
+            snapped.append((t, d, m, v))
+        notes = snapped
+
+    _mod_logger.debug("postprocess_notes: output %d notes", len(notes))
+    return sorted(notes, key=lambda x: x[0])
+
+
+def export_midi(notes, output_path, tempo=120.0, program=0, channel=0):
+    """ノートリスト → MIDI ファイル出力。
+
+    変更理由: ⑤MIDI出力改善 — pretty_midi で正確な note_on/off を処理。
+    未インストール時は既存の mido でフォールバック。
+
+    Args:
+        notes       : [(onset_s, dur_s, midi, vel), ...]
+        output_path : 保存先パス (.mid)
+        tempo       : BPM
+        program     : GM プログラム番号 (0=ピアノ)
+        channel     : MIDI チャンネル (0-15)
+    Returns:
+        bool — 成功なら True
+    """
+    if not notes:
+        _mod_logger.warning("export_midi: empty notes list")
+        return False
+
+    # pretty_midi を優先
+    try:
+        import pretty_midi
+        pm = pretty_midi.PrettyMIDI(initial_tempo=float(tempo))
+        inst = pretty_midi.Instrument(program=program, name="melody")
+        for (t, d, m, v) in notes:
+            note = pretty_midi.Note(
+                velocity=int(np.clip(v, 1, 127)),
+                pitch=int(np.clip(m, 0, 127)),
+                start=float(t),
+                end=float(t + max(d, 0.01)),
+            )
+            inst.notes.append(note)
+        pm.instruments.append(inst)
+        pm.write(str(output_path))
+        _mod_logger.info("export_midi (pretty_midi): %s", output_path)
+        return True
+    except ImportError:
+        _mod_logger.info("pretty_midi 未インストール、mido にフォールバック")
+    except Exception as e:
+        _mod_logger.warning("pretty_midi export failed: %s — mido にフォールバック", e)
+
+    # mido フォールバック（既存 _save_midi と同等ロジック）
+    try:
+        mid = MidiFile(type=0, ticks_per_beat=480)
+        tpb = 480
+        us = int(60_000_000 / max(tempo, 1))
+        def s2t(s):
+            return int(s * tempo / 60 * tpb)
+        trk = MidiTrack()
+        mid.tracks.append(trk)
+        trk.append(MetaMessage('set_tempo', tempo=us, time=0))
+        trk.append(Message('program_change', channel=channel,
+                           program=program, time=0))
+        evs = []
+        for (t, d, m, v) in notes:
+            note = int(np.clip(m, 0, 127))
+            vel = int(np.clip(v, 1, 127))
+            evs.append((s2t(t), Message(
+                'note_on', channel=channel, note=note,
+                velocity=vel, time=0)))
+            evs.append((s2t(t + d), Message(
+                'note_off', channel=channel, note=note,
+                velocity=0, time=0)))
+        evs.sort(key=lambda x: x[0])
+        prev = 0
+        for tick, msg in evs:
+            msg.time = max(0, tick - prev)
+            trk.append(msg)
+            prev = tick
+        mid.save(str(output_path))
+        _mod_logger.info("export_midi (mido fallback): %s", output_path)
+        return True
+    except Exception as e:
+        _mod_logger.error("export_midi failed: %s", e)
+        return False
+
+
+def infer_with_separation(input_path, output_midi_path=None,
+                          mode="ai", on_progress=None):
+    """音源分離 (Demucs) → other ステムのみ耳コピ → ノートリスト返却。
+
+    変更理由: ①音源分離追加 — 既存 _demucs_separate をスタンドアロンで
+    利用可能にし、other.wav のみを耳コピに使用する。
+
+    Args:
+        input_path      : 入力音声ファイルパス
+        output_midi_path: MIDI 保存先 (None = 保存しない)
+        mode            : EarCopyEngine のモード ("ai" 推奨)
+        on_progress     : 進捗コールバック fn(msg, pct)
+    Returns:
+        [(onset_s, dur_s, midi, vel), ...] — other ステムの採譜結果
+    """
+    _mod_logger.info("infer_with_separation: %s", input_path)
+
+    engine = EarCopyEngine(on_progress=on_progress, mode=mode)
+
+    # ① 音源分離 (Demucs)
+    try:
+        if not _ensure_ai_packages(on_progress or (lambda m, p=None: None)):
+            _mod_logger.warning("AI パッケージ準備失敗")
+    except Exception:
+        pass
+    stems = engine._demucs_separate(input_path)
+
+    if stems is None:
+        _mod_logger.warning("Demucs 失敗、入力全体をフォールバック解析します")
+        y, sr_use = engine._load(input_path)
+        other_audio = y
+    else:
+        other_audio = stems.get("other")
+        sr_use = SR
+        if other_audio is None:
+            _mod_logger.error("other ステムが見つかりません")
+            return []
+
+    # ② other ステムを前処理
+    other_stem = engine._preprocess_stem(other_audio, sr_use, 'other')
+
+    # ③ 採譜 (Basic Pitch → fallback: CQT+pyin)
+    notes = engine._basic_pitch_notes(other_stem, sr_use, is_vocal=False)
+    notes = engine._transformer_refine(notes)
+    notes = engine._remove_overlapping_notes(notes)
+    _mod_logger.info("  採譜結果: %d ノート", len(notes))
+
+    # ④ テンポ推定 + 後処理
+    try:
+        tempo, _beats = engine._tempo(other_audio, sr_use)
+        tempo = float(tempo) if tempo else 120.0
+    except Exception:
+        tempo = 120.0
+    notes = postprocess_notes(notes, tempo=tempo)
+
+    # ⑤ MIDI 保存 (オプション)
+    if output_midi_path:
+        export_midi(notes, output_midi_path, tempo=tempo)
+        _mod_logger.info("  MIDI 保存: %s", output_midi_path)
+
+    return notes
+
+
+# =====================================================
 # エントリーポイント
 # =====================================================
 
