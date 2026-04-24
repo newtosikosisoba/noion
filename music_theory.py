@@ -776,5 +776,654 @@ if __name__ == "__main__":
     scored = score_confidence(refined, chords=chords,
                               key_root=0, key_mode='major')
     print("--- 信頼度 ---")
-    for s in scored:
+    for s in scored:  # noqa: E501 (keep original demo intact)
         print(f"  midi={s[2]:3d} conf={s[4]:.2f}")
+
+# =====================================================
+# ① 時系列安定化: ChordHistory
+# =====================================================
+
+class ChordHistory:
+    """コード推定を時間方向で安定化する履歴バッファ。
+
+    過去 window フレームのコード推定を保持し、
+    多数決 (最頻値) で安定したコードを返す。
+    信頼度が低い場合は前フレームのコードを維持。
+
+    ① 時系列安定化: chord_history で多数決
+    ② コード補正強化: confidence 導入 + 遷移平滑化
+    """
+
+    def __init__(self, window=8, min_confidence=0.40,
+                 transition_penalty=0.15):
+        """
+        window             : 多数決対象の履歴フレーム数
+        min_confidence     : これ未満は前フレームを維持
+        transition_penalty : 直前コードと異なる場合のスコア罰則
+        """
+        self.window = window
+        self.min_confidence = min_confidence
+        self.transition_penalty = transition_penalty
+        self._history = []          # [(root, quality, score), ...]
+        self._stable = None         # 現在の安定コード
+
+    def update(self, root, quality, score):
+        """新しいフレームのコード推定を投入し、安定コードを返す。
+
+        Returns:
+            (root, quality, confidence) — 安定化後のコード
+        """
+        # 信頼度が低すぎる場合は前フレームを維持
+        if score < self.min_confidence and self._stable is not None:
+            self._history.append(self._stable)
+        else:
+            self._history.append((root, quality, score))
+
+        if len(self._history) > self.window:
+            self._history.pop(0)
+
+        # 多数決 (root, quality) ペアの最頻値
+        votes = Counter((r, q) for r, q, _ in self._history)
+        (best_root, best_q), count = votes.most_common(1)[0]
+
+        # スコア平均
+        scores = [s for r, q, s in self._history
+                  if r == best_root and q == best_q]
+        avg_score = float(np.mean(scores)) if scores else 0.0
+
+        # 遷移罰則: 直前と異なるコードは confidence を下げる
+        if (self._stable is not None and
+                (best_root, best_q) != self._stable[:2]):
+            avg_score -= self.transition_penalty
+
+        self._stable = (best_root, best_q, max(0.0, avg_score))
+        return self._stable
+
+    def reset(self):
+        self._history.clear()
+        self._stable = None
+
+
+def estimate_chords_stable(audio, sr=44100, beat_times=None,
+                            hop_length=512, window=8,
+                            min_confidence=0.40):
+    """① + ② 時系列安定化付きコード推定。
+
+    estimate_chords() を ChordHistory で安定化する。
+
+    Returns:
+        [(onset_s, dur_s, root_pc, quality, confidence), ...]
+    """
+    raw = estimate_chords(audio, sr=sr, beat_times=beat_times,
+                          hop_length=hop_length)
+    if not raw:
+        return raw
+
+    history = ChordHistory(window=window, min_confidence=min_confidence)
+    stable_events = []
+    for (onset, dur, root, q, score) in raw:
+        s_root, s_q, s_conf = history.update(root, q, score)
+        stable_events.append((onset, dur, s_root, s_q, s_conf))
+
+    # 連続する同コードを再マージ
+    return _merge_adjacent_chords(stable_events)
+
+
+# =====================================================
+# ③ セクション別キー推定: SectionKeyEstimator
+# =====================================================
+
+class SectionKeyEstimator:
+    """曲をセクション (複数小節単位) に分割し、
+    セクションごとにキーを再推定する。
+
+    転調を検出し、セクション単位でスケールフィルタを適用可能。
+    """
+
+    def __init__(self, section_sec=16.0, min_confidence=0.45):
+        """
+        section_sec    : 1 セクションの長さ (秒)
+        min_confidence : これ未満のセクションは前セクションのキーを引き継ぐ
+        """
+        self.section_sec = section_sec
+        self.min_confidence = min_confidence
+        self.sections = []   # [(start, end, key_root, key_mode, score), ...]
+
+    def analyze(self, audio, sr=44100):
+        """音声全体を解析してセクション別キーを推定する。
+
+        Returns:
+            self (メソッドチェーン可)
+        """
+        total = len(audio) / sr
+        self.sections = []
+        prev = (0, 'major')
+
+        hop = int(self.section_sec * sr)
+        for i, start in enumerate(range(0, len(audio), hop)):
+            seg = audio[start:start + hop]
+            if len(seg) < sr:          # 1秒未満はスキップ
+                break
+            root, mode, score = estimate_key(seg, sr=sr)
+            end = min((i + 1) * self.section_sec, total)
+            if score < self.min_confidence:
+                root, mode = prev
+                score = 0.0
+            self.sections.append((i * self.section_sec, end,
+                                  root, mode, score))
+            prev = (root, mode)
+
+        log.info("SectionKeyEstimator: %d sections", len(self.sections))
+        return self
+
+    def key_at(self, t):
+        """時刻 t のキーを返す。"""
+        for (start, end, root, mode, score) in self.sections:
+            if start <= t < end:
+                return (root, mode, score)
+        if self.sections:
+            return self.sections[-1][2:]  # type: ignore
+        return (0, 'major', 0.0)
+
+    def filter_notes(self, notes, tolerance=0.15):
+        """セクション別キーでスケールフィルタを適用。"""
+        if not self.sections:
+            return notes
+        out = []
+        for (t, d, m, v) in notes:
+            root, mode, score = self.key_at(t)
+            if score < self.min_confidence:
+                out.append((t, d, m, v))  # 信頼低 → 通過
+                continue
+            allowed = _scale_pc_set(root, mode)
+            pc = int(m) % 12
+            if pc in allowed:
+                out.append((t, d, m, v))
+            elif d <= tolerance:
+                out.append((t, d, m, max(1, int(v * 0.7))))
+        return out
+
+
+# =====================================================
+# ④ 動的信頼度フィルタ
+# =====================================================
+
+def filter_by_dynamic_threshold(notes, chords=None,
+                                 key_root=None, key_mode=None,
+                                 top_k_per_window=5,
+                                 window_sec=0.1):
+    """④ ノート信頼度を動的閾値でフィルタする。
+
+    固定 threshold ではなく、各時間窓内で上位 top_k のみ残す。
+    + 平均 confidence 以下のノートも削除。
+
+    Args:
+        notes           : [(onset, dur, midi, vel), ...]
+        top_k_per_window: 時間窓内で残す最大ノート数
+        window_sec      : 時間窓の幅 (秒)
+    """
+    if not notes:
+        return notes
+
+    scored = score_confidence(notes, chords=chords,
+                              key_root=key_root, key_mode=key_mode)
+    if not scored:
+        return notes
+
+    # 平均 confidence
+    avg_conf = float(np.mean([s[4] for s in scored]))
+    min_thr = max(0.15, avg_conf * 0.7)  # 平均の70%以下は削除
+
+    notes_sorted = sorted(scored, key=lambda n: n[0])
+    result = []
+    n = len(notes_sorted)
+    i = 0
+    while i < n:
+        t_i = notes_sorted[i][0]
+        group = []
+        j = i
+        while j < n and notes_sorted[j][0] - t_i < window_sec:
+            group.append(notes_sorted[j])
+            j += 1
+        # top-K and above-threshold
+        group_pass = [rec for rec in group if rec[4] >= min_thr]
+        group_pass.sort(key=lambda r: r[4], reverse=True)
+        for rec in group_pass[:top_k_per_window]:
+            result.append((rec[0], rec[1], rec[2], rec[3]))
+        i = j
+
+    return sorted(result, key=lambda n: n[0])
+
+
+# =====================================================
+# ⑤ 和音構造の強制 (Triad Enforcer)
+# =====================================================
+
+def enforce_triad_structure(notes, chords,
+                             max_voices=4,
+                             keep_bass=True,
+                             bass_range=(0, 55)):
+    """⑤ 同時発音をトライアドベースに整理する。
+
+    同時刻 (50ms窓) に max_voices を超える音がある場合:
+    1. コードトーン (root/3rd/5th) を優先して残す
+    2. 余分なテンション音 (7th以上) を削る
+    3. bass_range 内のノートは keep_bass=True なら保護
+
+    Args:
+        max_voices : 同時最大声部数 (4 = triad + bass)
+    """
+    if not notes or not chords:
+        return notes
+
+    notes_sorted = sorted(notes, key=lambda n: n[0])
+    result = []
+    n = len(notes_sorted)
+    window = 0.05
+    i = 0
+
+    while i < n:
+        t_i = notes_sorted[i][0]
+        group = []
+        j = i
+        while j < n and notes_sorted[j][0] - t_i < window:
+            group.append(notes_sorted[j])
+            j += 1
+
+        if len(group) <= max_voices:
+            result.extend(group)
+        else:
+            active = _active_chord_at(chords, t_i)
+            if active is None:
+                result.extend(group[:max_voices])
+                i = j
+                continue
+
+            root, q, _ = active
+            triad_ivs = CHORD_INTERVALS.get(q, [0, 4, 7])[:3]
+            triad_pcs = {(root + iv) % 12 for iv in triad_ivs}
+            chord_pcs = _chord_pitch_classes(root, q)
+
+            def _priority(note):
+                t, d, m, v = note
+                pc = int(m) % 12
+                in_bass = keep_bass and bass_range[0] <= m <= bass_range[1]
+                if in_bass:
+                    return (0, -v)       # bass 最優先
+                if pc in triad_pcs:
+                    return (1, -v)       # triad
+                if pc in chord_pcs:
+                    return (2, -v)       # 7th など拡張コード
+                return (3, -v)           # コード外
+
+            group.sort(key=_priority)
+            result.extend(group[:max_voices])
+
+        i = j
+
+    return sorted(result, key=lambda n: n[0])
+
+
+# =====================================================
+# ⑥ ベースライン最適化
+# =====================================================
+
+def optimize_bass(notes, chords, bass_range=(24, 55),
+                  max_jump=12, root_snap_strength=0.8):
+    """⑥ ベースノートをコードルートに寄せ、急激なジャンプを抑制する。
+
+    処理:
+    1. ベースノートをコードルートの最近傍オクターブにスナップ
+    2. 隣接ベースノート間のジャンプが max_jump 以上 → 中間を補間
+    3. 連続する同ピッチをマージ (滑らか化)
+
+    Args:
+        root_snap_strength : 0-1 (1.0=完全にルートへ移動)
+    """
+    if not notes or not chords:
+        return notes
+
+    bass = [(t, d, m, v) for (t, d, m, v) in notes
+            if bass_range[0] <= m <= bass_range[1]]
+    other = [(t, d, m, v) for (t, d, m, v) in notes
+             if not (bass_range[0] <= m <= bass_range[1])]
+
+    if not bass:
+        return notes
+
+    bass.sort(key=lambda n: n[0])
+
+    # 1. コードルートへのスナップ
+    snapped = []
+    for (t, d, m, v) in bass:
+        active = _active_chord_at(chords, t)
+        if active is None:
+            snapped.append((t, d, m, v))
+            continue
+        root_pc, q, score = active
+        if score < 0.35:
+            snapped.append((t, d, m, v))
+            continue
+
+        # ルートの最近傍オクターブを探す
+        best_m = m
+        best_dist = 999
+        for oct_ in range(1, 7):
+            candidate = root_pc + 12 * oct_
+            if bass_range[0] <= candidate <= bass_range[1]:
+                dist = abs(candidate - m)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_m = candidate
+
+        if best_dist <= 6:  # 半音6以内なら部分スナップ
+            new_m = int(round(m + (best_m - m) * root_snap_strength))
+            new_m = max(bass_range[0], min(bass_range[1], new_m))
+        else:
+            new_m = m
+        snapped.append((t, d, new_m, v))
+
+    # 2. 急激なジャンプ抑制
+    smooth = [snapped[0]]
+    for i in range(1, len(snapped)):
+        prev = smooth[-1]
+        cur = snapped[i]
+        jump = abs(cur[2] - prev[2])
+        if jump > max_jump:
+            # ジャンプが大きすぎるなら 1 オクターブ分戻す
+            direction = 1 if cur[2] > prev[2] else -1
+            new_m = cur[2] - direction * 12
+            new_m = max(bass_range[0], min(bass_range[1], new_m))
+            smooth.append((cur[0], cur[1], new_m, cur[3]))
+        else:
+            smooth.append(cur)
+
+    return sorted(smooth + other, key=lambda n: n[0])
+
+
+# =====================================================
+# ⑦ リズム強化 (最小ノート長 + 強制量子化)
+# =====================================================
+
+def stabilize_rhythm(notes, tempo=120.0, beat_times=None,
+                     min_dur_sec=0.06, subdivision=16,
+                     strength=0.8):
+    """⑦ リズム安定化の強化版。
+
+    1. min_dur_sec 未満のノートを削除
+    2. 強めの量子化 (strength=0.8)
+    3. 同ピッチ短間隔ノートをマージ
+    """
+    if not notes:
+        return notes
+
+    # 1. 最小長フィルタ
+    filtered = [(t, d, m, v) for (t, d, m, v) in notes
+                if d >= min_dur_sec]
+
+    # 2. 量子化
+    filtered = quantize_rhythm(filtered, tempo=tempo,
+                               beat_times=beat_times,
+                               subdivision=subdivision,
+                               strength=strength)
+
+    # 3. 同ピッチ短間隔マージ (gap < 1/4拍)
+    beat_dur = 60.0 / max(tempo, 30)
+    gap_thr = beat_dur / 4
+    by_pitch = {}
+    for n in filtered:
+        by_pitch.setdefault(n[2], []).append(n)
+
+    out = []
+    for midi, group in by_pitch.items():
+        group.sort(key=lambda n: n[0])
+        merged = [list(group[0])]
+        for note in group[1:]:
+            last = merged[-1]
+            gap = note[0] - (last[0] + last[1])
+            if 0 < gap < gap_thr:
+                last[1] = note[0] + note[1] - last[0]
+                last[3] = max(last[3], note[3])
+            else:
+                merged.append(list(note))
+        out.extend(tuple(m) for m in merged)
+
+    return sorted(out, key=lambda n: n[0])
+
+
+# =====================================================
+# ⑧ モデル出力スムージング (予測確率行列に適用)
+# =====================================================
+
+def smooth_predictions(pitch_prob, onset_prob,
+                        method='ema', alpha=0.4, window=3):
+    """⑧ フレーム確率行列に時間方向スムージングを適用する。
+
+    mimikopi.py の _decode_predictions に渡す前に使用。
+
+    Args:
+        pitch_prob : (T, P) ndarray 0-1
+        onset_prob : (T, P) ndarray 0-1
+        method     : 'ema' (指数移動平均) or 'moving_avg'
+        alpha      : EMA のスムージング係数 (小さいほど強く平滑化)
+        window     : moving_avg のウィンドウ幅
+
+    Returns:
+        (smoothed_pitch_prob, smoothed_onset_prob) どちらも (T, P)
+    """
+    if pitch_prob is None or pitch_prob.size == 0:
+        return pitch_prob, onset_prob
+
+    def _smooth(arr):
+        T, P = arr.shape
+        if method == 'ema':
+            out = arr.copy()
+            for t in range(1, T):
+                out[t] = alpha * arr[t] + (1 - alpha) * out[t - 1]
+            return out
+        else:  # moving_avg
+            kernel = np.ones(window) / window
+            out = np.apply_along_axis(
+                lambda col: np.convolve(col, kernel, mode='same'),
+                axis=0, arr=arr
+            )
+            return np.clip(out, 0.0, 1.0)
+
+    p_smooth = _smooth(pitch_prob)
+    # onset はあまり平滑化しすぎると検出が鈍くなるので控えめに
+    o_alpha = min(alpha * 1.5, 0.8)
+    o_smooth = _smooth(onset_prob) if method != 'ema' else (
+        onset_prob * o_alpha + np.roll(onset_prob, 1, axis=0) * (1 - o_alpha)
+    )
+    return p_smooth.astype(np.float32), o_smooth.astype(np.float32)
+
+
+# =====================================================
+# ⑨ エラー耐性: 無音 / ノイズ検出
+# =====================================================
+
+def filter_silence_noise(notes, audio, sr=44100,
+                          silence_rms=0.005,
+                          noise_dur_max=0.04,
+                          hop_length=512):
+    """⑨ 無音区間の誤検出ノートと突発ノイズを除去する。
+
+    処理:
+    1. 音声の RMS を時間軸に沿って計算
+    2. RMS < silence_rms の区間で発生したノートを削除
+    3. dur < noise_dur_max かつ その前後が無音の突発ノートを削除
+
+    Args:
+        audio         : 元音声 1D ndarray
+        silence_rms   : 無音判定閾値
+        noise_dur_max : ノイズノート判定の最大デュレーション (秒)
+    """
+    if not notes or audio is None or len(audio) == 0:
+        return notes
+
+    try:
+        import librosa
+        rms = librosa.feature.rms(y=audio, frame_length=2048,
+                                   hop_length=hop_length)[0]
+    except Exception:
+        return notes
+
+    frame_sec = hop_length / sr
+
+    def _rms_at(t):
+        f = int(t / frame_sec)
+        f = max(0, min(len(rms) - 1, f))
+        return float(rms[f])
+
+    out = []
+    notes_sorted = sorted(notes, key=lambda n: n[0])
+    n = len(notes_sorted)
+
+    for i, (t, d, m, v) in enumerate(notes_sorted):
+        # 無音区間チェック (ノート中間時刻)
+        mid_t = t + d / 2
+        if _rms_at(mid_t) < silence_rms:
+            continue
+
+        # 突発ノイズチェック
+        if d <= noise_dur_max:
+            prev_rms = _rms_at(t - 0.05) if t > 0.05 else 0.0
+            next_rms = _rms_at(t + d + 0.05)
+            if prev_rms < silence_rms * 3 and next_rms < silence_rms * 3:
+                continue
+
+        out.append((t, d, m, v))
+
+    log.debug("filter_silence_noise: %d → %d", len(notes), len(out))
+    return out
+
+
+# =====================================================
+# MusicTheoryCorrector の拡張版 (9機能統合)
+# =====================================================
+
+class AdvancedMusicTheoryCorrector(MusicTheoryCorrector):
+    """MusicTheoryCorrector に ①〜⑨ の拡張を加えたクラス。
+
+    継承で既存機能を維持しつつ新機能を追加。
+    """
+
+    def __init__(self, audio=None, sr=44100, tempo=120.0,
+                 beat_times=None, hop_length=512,
+                 chord_window=8, section_sec=16.0):
+        """
+        chord_window : ChordHistory のウィンドウ (フレーム数)
+        section_sec  : SectionKeyEstimator のセクション長 (秒)
+        """
+        # ① ② 安定化コード推定
+        self._chord_history = ChordHistory(window=chord_window)
+        # ③ セクション別キー推定
+        self._section_key = SectionKeyEstimator(section_sec=section_sec)
+
+        # 親の __init__ は chords / key_root / key_mode を設定する
+        # ただし chords は安定化版で上書きする
+        super().__init__(
+            audio=audio, sr=sr, tempo=tempo,
+            beat_times=beat_times, hop_length=hop_length,
+        )
+
+        if audio is not None and len(audio) > 0:
+            # 安定化コード推定で上書き
+            self.chords = estimate_chords_stable(
+                audio, sr=sr, beat_times=beat_times,
+                hop_length=hop_length,
+                window=chord_window,
+            )
+            # セクション別キー推定
+            self._section_key.analyze(audio, sr=sr)
+
+    def correct(self, notes, audio=None,
+                apply_scale=True,
+                apply_chord=True,
+                apply_bass=True,
+                apply_rhythm=True,
+                apply_confidence=True,
+                apply_harmony=True,
+                apply_triad=True,
+                apply_bass_opt=True,
+                apply_silence=True,
+                confidence_threshold=0.28,
+                max_polyphony=4,
+                quantize_strength=0.65,
+                top_k_per_window=5):
+        """拡張フルパイプライン。
+
+        親クラスの correct() を置き換え、9機能を全適用。
+        """
+        if not notes:
+            return notes
+
+        log.info("AdvancedMusicTheoryCorrector.correct: input=%d", len(notes))
+
+        # ⑨ 無音・ノイズ除去 (最初に適用して後続の負荷を減らす)
+        raw_audio = (audio if audio is not None else getattr(self, "audio", None))
+        if apply_silence and raw_audio is not None:
+            notes = filter_silence_noise(notes, raw_audio, sr=self.sr)
+
+        # ④ ベース安定化
+        if apply_bass:
+            notes = stabilize_bass(notes)
+
+        # ③ セクション別スケールフィルタ
+        if apply_scale:
+            if self._section_key.sections:
+                notes = self._section_key.filter_notes(notes)
+            elif self.key_score > 0.3:
+                notes = filter_by_scale(notes, self.key_root, self.key_mode)
+
+        # ② コード補正 (安定化コード使用)
+        if apply_chord and self.chords:
+            notes = correct_by_chord(
+                notes, self.chords, max_polyphony=max_polyphony
+            )
+
+        # ⑤ トライアド構造強制
+        if apply_triad and self.chords:
+            notes = enforce_triad_structure(
+                notes, self.chords, max_voices=max_polyphony
+            )
+
+        # ⑦ 和音優先
+        if apply_harmony and self.chords:
+            notes = prioritize_harmony(notes, self.chords)
+
+        # ⑥ ベースライン最適化
+        if apply_bass_opt and self.chords:
+            notes = optimize_bass(notes, self.chords)
+
+        # ⑦ リズム安定化 (強化版)
+        if apply_rhythm:
+            notes = stabilize_rhythm(
+                notes, tempo=self.tempo,
+                beat_times=self.beat_times,
+                strength=quantize_strength,
+            )
+
+        # ④ 動的信頼度フィルタ
+        if apply_confidence:
+            key_root = (self.key_root if self.key_score > 0.3 else None)
+            key_mode = (self.key_mode if self.key_score > 0.3 else None)
+            notes = filter_by_dynamic_threshold(
+                notes,
+                chords=self.chords,
+                key_root=key_root,
+                key_mode=key_mode,
+                top_k_per_window=top_k_per_window,
+            )
+
+        log.info("AdvancedMusicTheoryCorrector.correct: output=%d", len(notes))
+        return sorted(notes, key=lambda n: n[0])
+
+
+def correct_notes_advanced(notes, audio=None, sr=44100, tempo=120.0,
+                            beat_times=None, **kwargs):
+    """⑨機能統合ワンショット関数。"""
+    mtc = AdvancedMusicTheoryCorrector(
+        audio=audio, sr=sr, tempo=tempo, beat_times=beat_times,
+    )
+    return mtc.correct(notes, audio=audio, **kwargs)

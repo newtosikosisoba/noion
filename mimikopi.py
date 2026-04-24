@@ -1827,46 +1827,54 @@ class EarCopyEngine:
         other_notes = self._extend_sustains(other_notes)
         vocal_notes = self._extend_sustains(vocal_notes)
 
-        # 3f. 音楽理論補正 (music_theory.py)
+        # 3f. 音楽理論補正 (AdvancedMusicTheoryCorrector: ①〜⑨)
         try:
-            from music_theory import MusicTheoryCorrector
-            self._log("  音楽理論補正中...", 70)
-            mtc = MusicTheoryCorrector(
+            from music_theory import AdvancedMusicTheoryCorrector
+            self._log("  音楽理論補正中 (9機能)...", 70)
+            mtc = AdvancedMusicTheoryCorrector(
                 audio=y, sr=sr,
                 tempo=self._current_tempo,
                 beat_times=beats,
+                chord_window=8,
+                section_sec=16.0,
             )
             if mtc.key_score > 0.3:
-                self._log(f"  推定キー (理論補正): "
-                          f"{mtc.key_root} {mtc.key_mode} "
-                          f"(score={mtc.key_score:.2f})", 70)
+                self._log(
+                    f"  推定キー: {['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][mtc.key_root]} {mtc.key_mode} "
+                    f"(score={mtc.key_score:.2f}) "
+                    f"sections={len(mtc._section_key.sections)}", 70)
             vocal_notes = mtc.correct(
-                vocal_notes,
+                vocal_notes, audio=y,
                 apply_bass=False,
+                apply_bass_opt=False,
+                apply_triad=False,       # メロディはトライアド強制しない
                 max_polyphony=2,
                 quantize_strength=0.4,
-                confidence_threshold=0.25,
+                top_k_per_window=2,
             )
             other_notes = mtc.correct(
-                other_notes,
+                other_notes, audio=y,
                 apply_bass=False,
-                max_polyphony=6,
-                quantize_strength=0.6,
-                confidence_threshold=0.30,
+                apply_triad=True,
+                apply_bass_opt=False,
+                max_polyphony=5,
+                quantize_strength=0.65,
+                top_k_per_window=5,
             )
             bass_notes = mtc.correct(
-                bass_notes,
+                bass_notes, audio=y,
                 apply_scale=False,
                 apply_chord=False,
                 apply_harmony=False,
+                apply_triad=False,
                 apply_bass=True,
-                quantize_strength=0.5,
-                confidence_threshold=0.20,
+                apply_bass_opt=True,
+                quantize_strength=0.7,
+                top_k_per_window=2,
             )
-            self._log(f"  理論補正完了: "
-                      f"vocal={len(vocal_notes)} "
-                      f"other={len(other_notes)} "
-                      f"bass={len(bass_notes)}", 71)
+            self._log(
+                f"  理論補正完了: vocal={len(vocal_notes)} "
+                f"other={len(other_notes)} bass={len(bass_notes)}", 71)
         except ImportError:
             pass  # music_theory.py が無くても既存動作に影響なし
         except Exception as e:
@@ -3913,7 +3921,7 @@ def infer_with_separation(input_path, output_midi_path=None,
 
     # ④-b 音楽理論補正
     try:
-        from music_theory import correct_notes as _mt_correct
+        from music_theory import correct_notes_advanced as _mt_correct
         beat_arr = _beats if '_beats' in dir() and _beats is not None else None
         notes = _mt_correct(notes, audio=other_audio, sr=sr_use,
                             tempo=tempo, beat_times=beat_arr)
@@ -4124,6 +4132,15 @@ if HAS_TORCH:
             # numpy 変換は 1 回のみ（推論最適化）
             p_np = pitch_prob.cpu().numpy()
             o_np = onset_prob.cpu().numpy()
+
+            # ⑧ 時間方向スムージング (EMA でフレームブレを低減)
+            try:
+                from music_theory import smooth_predictions
+                p_np, o_np = smooth_predictions(p_np, o_np,
+                                                method='ema', alpha=0.45)
+            except ImportError:
+                pass
+
             frame_sec = hop_length / sr
 
             return _decode_predictions(
@@ -4223,7 +4240,7 @@ def infer_with_light_model(audio, sr=44100, hop_length=512,
 
     # ④ 音楽理論補正
     try:
-        from music_theory import correct_notes as _mt_correct
+        from music_theory import correct_notes_advanced as _mt_correct
         notes = _mt_correct(notes, audio=audio, sr=sr, tempo=tempo)
     except ImportError:
         pass
