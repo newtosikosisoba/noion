@@ -1829,7 +1829,10 @@ class EarCopyEngine:
 
         # 3f. 音楽理論補正 (AdvancedMusicTheoryCorrector: ①〜⑨)
         try:
-            from music_theory import AdvancedMusicTheoryCorrector
+            from music_theory import (
+                AdvancedMusicTheoryCorrector, DelayedStabilizer,
+                smooth_chord_transitions,
+            )
             self._log("  音楽理論補正中 (9機能)...", 70)
             mtc = AdvancedMusicTheoryCorrector(
                 audio=y, sr=sr,
@@ -1838,6 +1841,12 @@ class EarCopyEngine:
                 chord_window=8,
                 section_sec=16.0,
             )
+            # ① 遅延許容型安定化 + ③ コード遷移制御
+            if mtc.chords:
+                stab = DelayedStabilizer(look_ahead=3, look_back=3)
+                mtc.chords = smooth_chord_transitions(
+                    stab.stabilize_chords(mtc.chords), hysteresis=0.10
+                )
             if mtc.key_score > 0.3:
                 self._log(
                     f"  推定キー: {['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][mtc.key_root]} {mtc.key_mode} "
@@ -1879,6 +1888,39 @@ class EarCopyEngine:
             pass  # music_theory.py が無くても既存動作に影響なし
         except Exception as e:
             self._log(f"  音楽理論補正スキップ: {e}", 71)
+
+        # 3g. ヒューマナイゼーション (人間演奏感の付与)
+        try:
+            from music_theory import humanize_notes
+            self._log("  ヒューマナイズ中...", 71)
+            # メロディ: ジッター強め、最小持続短め (歌は持続)
+            vocal_notes = humanize_notes(
+                vocal_notes, audio=y, sr=sr,
+                tempo=self._current_tempo, beat_times=beats,
+                min_dur=0.10, jitter_sec=0.012, vel_jitter=5,
+                max_polyphony=2, max_bass_jump=12,
+                accent_boost=8, seed=42,
+            )
+            # 伴奏: 中庸
+            other_notes = humanize_notes(
+                other_notes, audio=y, sr=sr,
+                tempo=self._current_tempo, beat_times=beats,
+                min_dur=0.08, jitter_sec=0.010, vel_jitter=4,
+                max_polyphony=5, max_bass_jump=12,
+                accent_boost=10, seed=43,
+            )
+            # ベース: ジッター控えめ、ジャンプ厳格
+            bass_notes = humanize_notes(
+                bass_notes, audio=y, sr=sr,
+                tempo=self._current_tempo, beat_times=beats,
+                min_dur=0.10, jitter_sec=0.006, vel_jitter=3,
+                max_polyphony=1, max_bass_jump=5,
+                midi_range=(24, 60), accent_boost=12, seed=44,
+            )
+        except ImportError:
+            pass
+        except Exception as e:
+            self._log(f"  ヒューマナイズスキップ: {e}", 71)
 
         # 3g. Velocity はクランプのみ（元のダイナミクスを潰さない）
         vocal_notes = self._normalize_velocity(vocal_notes, 50, 120)
@@ -3921,7 +3963,7 @@ def infer_with_separation(input_path, output_midi_path=None,
 
     # ④-b 音楽理論補正
     try:
-        from music_theory import correct_notes_advanced as _mt_correct
+        from music_theory import correct_and_humanize as _mt_correct
         beat_arr = _beats if '_beats' in dir() and _beats is not None else None
         notes = _mt_correct(notes, audio=other_audio, sr=sr_use,
                             tempo=tempo, beat_times=beat_arr)
@@ -4240,7 +4282,7 @@ def infer_with_light_model(audio, sr=44100, hop_length=512,
 
     # ④ 音楽理論補正
     try:
-        from music_theory import correct_notes_advanced as _mt_correct
+        from music_theory import correct_and_humanize as _mt_correct
         notes = _mt_correct(notes, audio=audio, sr=sr, tempo=tempo)
     except ImportError:
         pass

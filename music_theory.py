@@ -1427,3 +1427,308 @@ def correct_notes_advanced(notes, audio=None, sr=44100, tempo=120.0,
         audio=audio, sr=sr, tempo=tempo, beat_times=beat_times,
     )
     return mtc.correct(notes, audio=audio, **kwargs)
+
+
+# =====================================================
+# 最終チューニング層: ヒューマナイゼーション
+# =====================================================
+# 目的: 「正しい音」ではなく「人間が演奏したように聴こえる」出力
+# 構造変更なし、既存パイプラインの末尾に挿入する後処理層
+
+# ① 遅延許容型安定化 (look-ahead 多数決)
+class DelayedStabilizer:
+    """2〜3 フレームの遅延を許容して、未来も含めた多数決で確定する。
+
+    リアルタイムでない後処理なら全体を見渡せるので、
+    各時刻 t の決定を [t-W, t+W] の窓で多数決する。
+    """
+
+    def __init__(self, look_ahead=3, look_back=3):
+        self.look_ahead = look_ahead
+        self.look_back = look_back
+
+    def stabilize_chords(self, chord_events):
+        """chord_events: [(onset, dur, root, q, score), ...] を平滑化"""
+        if not chord_events:
+            return chord_events
+        n = len(chord_events)
+        out = []
+        for i in range(n):
+            lo = max(0, i - self.look_back)
+            hi = min(n, i + self.look_ahead + 1)
+            window = chord_events[lo:hi]
+            # スコア重み付き多数決
+            votes = {}
+            for (_, _, r, q, s) in window:
+                key = (r, q)
+                votes[key] = votes.get(key, 0.0) + max(s, 0.05)
+            best = max(votes.items(), key=lambda x: x[1])
+            (root, qual), weight = best
+            onset, dur, _, _, score = chord_events[i]
+            confidence = weight / sum(votes.values())
+            out.append((onset, dur, root, qual, confidence))
+        return _merge_adjacent_chords(out)
+
+
+# ② ノート持続補正
+def enforce_min_duration(notes, min_dur=0.08, extend_to=0.10):
+    """最低ノート長を保証。短いノートを extend_to まで延長。
+
+    Args:
+        min_dur   : これ未満のノートを処理対象にする
+        extend_to : 延長後の長さ (秒)
+    """
+    if not notes:
+        return notes
+    out = []
+    for (t, d, m, v) in notes:
+        if d < min_dur:
+            out.append((t, max(d, extend_to), m, v))
+        else:
+            out.append((t, d, m, v))
+    return out
+
+
+# ③ コード遷移制御 (前フレーム優先・微差は維持)
+def smooth_chord_transitions(chord_events, hysteresis=0.10):
+    """confidence 差が hysteresis 未満なら前のコードを維持する。
+
+    急激な遷移を抑制し、自然なコード持続を作る。
+    """
+    if not chord_events:
+        return chord_events
+    out = [chord_events[0]]
+    prev_root, prev_q, prev_conf = chord_events[0][2:5]
+    for ev in chord_events[1:]:
+        onset, dur, root, q, conf = ev
+        if (root, q) != (prev_root, prev_q):
+            # 信頼度差が小さいなら前を維持
+            if conf - prev_conf < hysteresis:
+                out.append((onset, dur, prev_root, prev_q, prev_conf))
+                continue
+        out.append(ev)
+        prev_root, prev_q, prev_conf = root, q, conf
+    return _merge_adjacent_chords(out)
+
+
+# ④ ベースライン滑らか化 (±5半音以内に制限)
+def smooth_bass_strict(notes, bass_range=(24, 55), max_jump=5):
+    """ベースの隣接ノート間ジャンプを max_jump 半音以内に制限。
+
+    超える場合は前ノートに半音単位で寄せる (8度以上は1オクターブ補正)。
+    """
+    if not notes:
+        return notes
+    bass = sorted([n for n in notes if bass_range[0] <= n[2] <= bass_range[1]],
+                  key=lambda x: x[0])
+    other = [n for n in notes if not (bass_range[0] <= n[2] <= bass_range[1])]
+    if len(bass) < 2:
+        return notes
+
+    smooth = [bass[0]]
+    for cur in bass[1:]:
+        prev = smooth[-1]
+        diff = cur[2] - prev[2]
+        if abs(diff) > max_jump:
+            # オクターブ単位で補正
+            shift = -12 if diff > 0 else 12
+            new_m = cur[2] + shift
+            # それでも超える場合は max_jump にクランプ
+            if abs(new_m - prev[2]) > max_jump:
+                new_m = prev[2] + (max_jump if diff > 0 else -max_jump)
+            new_m = max(bass_range[0], min(bass_range[1], new_m))
+            smooth.append((cur[0], cur[1], new_m, cur[3]))
+        else:
+            smooth.append(cur)
+    return sorted(smooth + other, key=lambda n: n[0])
+
+
+# ⑤ 動的閾値 (mean + α * std)
+def adaptive_threshold(values, alpha=-0.5, lower=0.10, upper=0.85):
+    """値ベクトルから mean + α * std で閾値を算出する。
+
+    α < 0 → 平均より下を許容 (緩い)
+    α > 0 → 平均より上のみ採用 (厳しい)
+    """
+    if values is None or len(values) == 0:
+        return lower
+    arr = np.asarray(values, dtype=float)
+    mean = float(np.mean(arr))
+    std = float(np.std(arr))
+    thr = mean + alpha * std
+    return float(np.clip(thr, lower, upper))
+
+
+def filter_by_adaptive_confidence(scored_notes, alpha=-0.3):
+    """⑤ score_confidence の出力を mean + α*std で動的に閾値処理する。"""
+    if not scored_notes:
+        return []
+    confs = [s[4] for s in scored_notes]
+    thr = adaptive_threshold(confs, alpha=alpha, lower=0.18, upper=0.55)
+    out = []
+    for rec in scored_notes:
+        if len(rec) == 5 and rec[4] >= thr:
+            out.append(rec[:4])
+        elif len(rec) == 4:
+            out.append(rec)
+    log.debug("filter_by_adaptive_confidence: thr=%.3f, kept %d/%d",
+              thr, len(out), len(scored_notes))
+    return out
+
+
+# ⑥ リズムの人間化 (微小ジッター)
+def humanize_rhythm(notes, jitter_sec=0.010, vel_jitter=4, seed=None):
+    """完全量子化を緩めるため、各ノートに微小ランダムを加える。
+
+    Args:
+        jitter_sec : onset の最大ずらし量 (±jitter_sec)
+        vel_jitter : velocity の最大ずらし量 (±vel_jitter)
+        seed       : 乱数シード (再現性が必要な場合)
+    """
+    if not notes:
+        return notes
+    rng = np.random.default_rng(seed)
+    out = []
+    for (t, d, m, v) in notes:
+        dt = float(rng.uniform(-jitter_sec, jitter_sec))
+        dv = int(rng.integers(-vel_jitter, vel_jitter + 1))
+        new_t = max(0.0, t + dt)
+        new_v = int(np.clip(v + dv, 1, 127))
+        out.append((new_t, d, m, new_v))
+    return sorted(out, key=lambda n: n[0])
+
+
+# ⑦ MIDI 最終整形 (同時発音制限・音域・velocity 強弱)
+def finalize_midi_shape(notes, max_polyphony=5,
+                        midi_range=(21, 108),
+                        accent_beats=None, beat_dur=0.5,
+                        accent_boost=12):
+    """同時発音制限・音域フィルタ・拍頭にアクセント。
+
+    Args:
+        max_polyphony : 同時最大ノート数 (50ms 窓)
+        midi_range    : 許容 MIDI 範囲 (A0=21, C8=108)
+        accent_beats  : アクセントを付ける拍時刻 (秒). None なら beat_dur 等分
+        beat_dur      : ビート長 (accent_beats が None のとき使用)
+        accent_boost  : 拍頭ノートの velocity 加算量
+    """
+    if not notes:
+        return notes
+
+    # 音域フィルタ
+    notes = [(t, d, m, v) for (t, d, m, v) in notes
+             if midi_range[0] <= m <= midi_range[1]]
+
+    # 同時発音制限 (vel 上位を残す)
+    notes.sort(key=lambda n: n[0])
+    result = []
+    n = len(notes)
+    window = 0.05
+    i = 0
+    while i < n:
+        t_i = notes[i][0]
+        group = [notes[i]]
+        j = i + 1
+        while j < n and notes[j][0] - t_i < window:
+            group.append(notes[j])
+            j += 1
+        if len(group) <= max_polyphony:
+            result.extend(group)
+        else:
+            group.sort(key=lambda x: -x[3])  # velocity 降順
+            result.extend(group[:max_polyphony])
+        i = j
+
+    # 拍頭アクセント
+    if accent_beats is None:
+        if not result:
+            return result
+        total = max(n[0] + n[1] for n in result)
+        accent_beats = np.arange(0, total + beat_dur, beat_dur)
+    accent_beats = np.asarray(accent_beats, dtype=float)
+
+    accented = []
+    for (t, d, m, v) in result:
+        # 最近傍ビートとの距離
+        dist = float(np.min(np.abs(accent_beats - t)))
+        if dist < 0.04:    # 拍頭(40ms以内)
+            new_v = int(np.clip(v + accent_boost, 30, 127))
+        elif dist < 0.10:  # 拍裏付近 → 弱める
+            new_v = int(np.clip(v - 3, 25, 127))
+        else:
+            new_v = v
+        accented.append((t, d, m, new_v))
+    return sorted(accented, key=lambda n: n[0])
+
+
+# ⑧ 全体最適化 (ヒューマナイゼーション統合)
+def humanize_notes(notes, audio=None, sr=44100, tempo=120.0,
+                   beat_times=None, chords=None,
+                   min_dur=0.08, jitter_sec=0.010, vel_jitter=4,
+                   max_polyphony=5, max_bass_jump=5,
+                   midi_range=(21, 108), accent_boost=10,
+                   apply_jitter=True, apply_accent=True,
+                   apply_bass_smooth=True, apply_min_dur=True,
+                   apply_polyphony=True, seed=None):
+    """ヒューマナイゼーションをまとめて適用する後処理関数。
+
+    既存パイプラインの末尾に挿入することで、
+    出力を「人間が演奏した」感じに整える。
+
+    処理順:
+      ② 最低ノート長の保証
+      ④ ベースライン滑らか化 (±5半音)
+      ⑦ 同時発音制限・音域フィルタ・拍頭アクセント
+      ⑥ リズム微小ジッター + velocity ジッター
+    """
+    if not notes:
+        return notes
+
+    if apply_min_dur:
+        notes = enforce_min_duration(notes, min_dur=min_dur,
+                                      extend_to=min_dur + 0.02)
+
+    if apply_bass_smooth:
+        notes = smooth_bass_strict(notes, max_jump=max_bass_jump)
+
+    if apply_polyphony:
+        notes = finalize_midi_shape(
+            notes, max_polyphony=max_polyphony,
+            midi_range=midi_range,
+            accent_beats=beat_times,
+            beat_dur=60.0 / max(tempo, 30.0),
+            accent_boost=accent_boost if apply_accent else 0,
+        )
+
+    if apply_jitter:
+        notes = humanize_rhythm(notes, jitter_sec=jitter_sec,
+                                vel_jitter=vel_jitter, seed=seed)
+
+    log.info("humanize_notes: output=%d notes", len(notes))
+    return notes
+
+
+def correct_and_humanize(notes, audio=None, sr=44100, tempo=120.0,
+                         beat_times=None, seed=None,
+                         humanize_kwargs=None, correct_kwargs=None):
+    """⑨機能補正 + ヒューマナイズ をワンショットで適用する。"""
+    correct_kwargs = correct_kwargs or {}
+    humanize_kwargs = humanize_kwargs or {}
+
+    mtc = AdvancedMusicTheoryCorrector(
+        audio=audio, sr=sr, tempo=tempo, beat_times=beat_times,
+    )
+
+    # 安定化済みコードを使ってヒューマナイズも一貫性を保つ
+    if mtc.chords:
+        # ① 遅延許容型安定化 + ③ 遷移平滑化
+        stabilizer = DelayedStabilizer(look_ahead=3, look_back=3)
+        stable = stabilizer.stabilize_chords(mtc.chords)
+        mtc.chords = smooth_chord_transitions(stable, hysteresis=0.10)
+
+    refined = mtc.correct(notes, audio=audio, **correct_kwargs)
+    final = humanize_notes(refined, audio=audio, sr=sr,
+                           tempo=tempo, beat_times=beat_times,
+                           chords=mtc.chords, seed=seed,
+                           **humanize_kwargs)
+    return final
