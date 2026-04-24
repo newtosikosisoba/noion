@@ -3875,6 +3875,299 @@ def infer_with_separation(input_path, output_midi_path=None,
 
 
 # =====================================================
+# 軽量耳コピモデル (LightTransformerModel)
+# =====================================================
+# 変更理由: MusicTransformer はノートトークン精製用。こちらは
+# 音声特徴量 → フレームレベルノート検出の専用軽量推論モデル。
+# CPU 前提: ~940K パラメータ、推論約 10ms/0.5sec。
+#
+# 既存コードは一切変更しない。新クラス・関数のみ追加。
+
+# MIDI ピッチクラス定義: クラス 0 = MIDI 36 (C2), クラス 59 = MIDI 95 (B6)
+_PITCH_OFFSET = 36
+_NUM_PITCHES  = 60
+
+
+def _decode_predictions(pitch_prob, onset_prob, frame_sec,
+                         pitch_thr=0.4, onset_thr=0.5):
+    """フレーム確率行列 → ノートイベントリスト。
+
+    純粋 numpy のみ（torch 依存なし）。ステートマシンで
+    onset + pitch アクティブ区間を追跡してノートに変換する。
+
+    Args:
+        pitch_prob : (T, _NUM_PITCHES) float ndarray 0-1
+        onset_prob : (T, _NUM_PITCHES) float ndarray 0-1
+        frame_sec  : 1 フレームの秒数 (hop_length / sr)
+    Returns:
+        [(onset_s, dur_s, midi, vel), ...]
+    """
+    T, P = pitch_prob.shape
+    notes = []
+
+    for p in range(P):
+        midi_note = p + _PITCH_OFFSET
+        active = False
+        start_t = 0
+        vel_acc = []
+
+        for t in range(T):
+            p_on = pitch_prob[t, p] >= pitch_thr
+            o_on = onset_prob[t, p] >= onset_thr
+
+            if not active:
+                if p_on and o_on:          # onset → ノート開始
+                    active = True
+                    start_t = t
+                    vel_acc = [pitch_prob[t, p]]
+            else:
+                if p_on and not o_on:      # 持続中
+                    vel_acc.append(pitch_prob[t, p])
+                else:
+                    # 音が消えるか再 onset → 現ノート終了
+                    dur = (t - start_t) * frame_sec
+                    if dur >= 0.02 and vel_acc:
+                        vel = int(np.clip(
+                            40 + float(np.mean(vel_acc)) * 80, 30, 120))
+                        notes.append((start_t * frame_sec, dur, midi_note, vel))
+                    active = False
+                    vel_acc = []
+                    if p_on and o_on:      # 即座に新 onset
+                        active = True
+                        start_t = t
+                        vel_acc = [pitch_prob[t, p]]
+
+        # ループ末尾で発音中のノートを閉じる
+        if active and vel_acc:
+            dur = (T - start_t) * frame_sec
+            if dur >= 0.02:
+                vel = int(np.clip(
+                    40 + float(np.mean(vel_acc)) * 80, 30, 120))
+                notes.append((start_t * frame_sec, dur, midi_note, vel))
+
+    return sorted(notes, key=lambda x: x[0])
+
+
+if HAS_TORCH:
+    class LightCNN(nn.Module):
+        """軽量 2 層 Conv1d: 特徴量を Transformer 入力次元へ圧縮する。
+
+        変更理由: 224 次元特徴量を Transformer に直接渡すと重いため、
+        CNN で 128 次元に圧縮してから渡す。
+        BatchNorm は batch_size=1 で不安定になるため省略。
+
+        入力: (B, T, in_channels)
+        出力: (B, T, d_model)
+        """
+
+        def __init__(self, in_channels=224, d_model=128, kernel_size=3):
+            super().__init__()
+            pad = kernel_size // 2
+            self.conv1 = nn.Conv1d(in_channels, d_model,
+                                   kernel_size, padding=pad)
+            self.conv2 = nn.Conv1d(d_model, d_model,
+                                   kernel_size, padding=pad)
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            # (B, T, C) → (B, C, T) → Conv → (B, d_model, T) → (B, T, d_model)
+            x = x.transpose(1, 2)
+            x = self.relu(self.conv1(x))
+            x = self.relu(self.conv2(x))
+            return x.transpose(1, 2)
+
+    class LightTransformerModel(nn.Module):
+        """軽量耳コピモデル: LightCNN + 2 層 Transformer + pitch/onset ヘッド。
+
+        設計思想:
+          - CPU 前提設計 (~940K パラメータ)
+          - MusicTransformer (トークン精製用 4 層) とは用途が異なる
+          - フレーム単位の pitch/onset を同時推定する二頭蛇構造
+          - ⑨ 0.5 秒フレーム入力前提、将来的なストリーム処理にも対応
+
+        パラメータ数概算:
+          CNN 2 層: ~270K, Transformer 2 層 d=128: ~656K,
+          ヘッド 2 本: ~15K → 合計 ~940K
+        """
+
+        def __init__(self, feature_dim=224, d_model=128, nhead=4,
+                     num_layers=2, dim_ff=256,
+                     num_pitches=_NUM_PITCHES, dropout=0.1,
+                     max_len=512):
+            super().__init__()
+            self.d_model = d_model
+            self.num_pitches = num_pitches
+            self._max_len = max_len
+            # ① CNN 特徴圧縮 (feature_dim → d_model)
+            self.cnn = LightCNN(feature_dim, d_model)
+            # ② 学習済み位置エンコーディング
+            self.pos_enc = nn.Embedding(max_len, d_model)
+            # ③ 軽量 2 層 Transformer (CPU 動作を最優先)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=nhead,
+                dim_feedforward=dim_ff, dropout=dropout,
+                batch_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(
+                enc_layer, num_layers=num_layers)
+            # ④ 出力ヘッド: pitch (アクティブ音) + onset (発音タイミング)
+            self.pitch_head = nn.Linear(d_model, num_pitches)
+            self.onset_head = nn.Linear(d_model, num_pitches)
+
+        def forward(self, x):
+            """x: (B, T, feature_dim)
+            戻り値: pitch_logits, onset_logits — 各 (B, T, num_pitches)
+            """
+            B, T, _ = x.shape
+            h = self.cnn(x)                              # (B, T, d_model)
+            T_enc = min(T, self._max_len)
+            pos = torch.arange(T_enc, device=x.device).unsqueeze(0)
+            h = h[:, :T_enc] + self.pos_enc(pos)        # 位置情報付加
+            h = self.transformer(h)                      # (B, T, d_model)
+            return self.pitch_head(h), self.onset_head(h)
+
+        @torch.no_grad()
+        def predict(self, features_np, top_k=5,
+                    pitch_thr=0.4, onset_thr=0.5,
+                    sr=44100, hop_length=512):
+            """numpy 特徴量 → ノートリスト（推論専用）。
+
+            変更理由: ⑦推論最適化 —
+              - torch.no_grad() でメモリ/計算を削減
+              - バッチサイズ 1 固定
+              - numpy 変換を予測後の 1 回のみに限定
+
+            Args:
+                features_np : (T, feature_dim) ndarray
+                top_k       : ⑧ 各フレームで採用する最大ノート数
+            Returns:
+                [(onset_s, dur_s, midi, vel), ...]
+            """
+            self.eval()
+            # バッチサイズ 1 固定 (B=1)
+            feat = torch.from_numpy(
+                features_np.astype(np.float32)
+            ).unsqueeze(0)                              # (1, T, feature_dim)
+            T = feat.shape[1]
+            if T > self._max_len:
+                feat = feat[:, :self._max_len, :]
+                T = self._max_len
+
+            pitch_logits, onset_logits = self(feat)
+            pitch_prob = torch.sigmoid(pitch_logits[0])  # (T, num_pitches)
+            onset_prob = torch.sigmoid(onset_logits[0])  # (T, num_pitches)
+
+            # ⑧ Top-K フィルタリング: 各フレームで上位 K 音のみ採用
+            if 0 < top_k < self.num_pitches:
+                _, topk_idx = pitch_prob.topk(top_k, dim=-1)
+                mask = torch.zeros_like(pitch_prob, dtype=torch.bool)
+                mask.scatter_(-1, topk_idx, True)
+                pitch_prob = pitch_prob * mask
+
+            # numpy 変換は 1 回のみ（推論最適化）
+            p_np = pitch_prob.cpu().numpy()
+            o_np = onset_prob.cpu().numpy()
+            frame_sec = hop_length / sr
+
+            return _decode_predictions(
+                p_np, o_np, frame_sec,
+                pitch_thr=pitch_thr, onset_thr=onset_thr,
+            )
+
+    class CombinedLoss(nn.Module):
+        """BCE(pitch) + 2×BCE(onset) + 時間方向スムージング Loss。
+
+        変更理由: ⑤損失改善 —
+          - onset を 2 倍重視: 音の立ち上がりタイミング精度を向上
+          - スムージング Loss: 隣接フレーム差を抑えてチラつきを低減
+            計算式: mean( (logit[t+1] - logit[t])^2 )
+        """
+
+        def __init__(self, onset_weight=2.0, smooth_weight=0.1):
+            super().__init__()
+            self.bce = nn.BCEWithLogitsLoss()
+            self.onset_weight = onset_weight
+            self.smooth_weight = smooth_weight
+
+        def forward(self, pitch_logits, onset_logits,
+                    pitch_target, onset_target):
+            """
+            *_logits : (B, T, num_pitches) — 生ロジット
+            *_target : (B, T, num_pitches) — 0/1 float テンソル
+            戻り値: (total_loss, {"pitch": float, "onset": float, "smooth": float})
+            """
+            loss_pitch = self.bce(pitch_logits, pitch_target)
+            loss_onset = (self.bce(onset_logits, onset_target)
+                          * self.onset_weight)
+            # 時間方向スムージング: 隣接フレームの差の 2 乗平均
+            smooth = ((pitch_logits[:, 1:] - pitch_logits[:, :-1]) ** 2).mean()
+            total = loss_pitch + loss_onset + smooth * self.smooth_weight
+            return total, {
+                "pitch":  float(loss_pitch),
+                "onset":  float(loss_onset),
+                "smooth": float(smooth),
+            }
+
+else:
+    # torch 未インストール時のスタブ（既存動作に影響なし）
+    class LightCNN:            # type: ignore[no-redef]
+        def __init__(self, **_): pass
+
+    class LightTransformerModel:   # type: ignore[no-redef]
+        def __init__(self, **_): pass
+        def predict(self, *_, **__): return []
+
+    class CombinedLoss:            # type: ignore[no-redef]
+        def __init__(self, **_): pass
+        def __call__(self, *_, **__): return 0.0, {}
+
+
+def infer_with_light_model(audio, sr=44100, hop_length=512,
+                            model=None, top_k=5,
+                            pitch_thr=0.4, onset_thr=0.5,
+                            tempo=120.0):
+    """音声 ndarray → 軽量モデルでノートリストを推論する。
+
+    変更理由: FeatureExtractor + LightTransformerModel + postprocess_notes を
+    一括して呼び出すエンドツーエンド推論関数。
+    torch 未インストール時は空リストを返す（後処理は既存コードに委譲可能）。
+
+    Args:
+        audio     : 1D float32 ndarray（モノラル）
+        sr        : サンプリングレート
+        hop_length: CQT/Mel ホップ長
+        model     : LightTransformerModel インスタンス (None=新規作成)
+        top_k     : フレームごとの最大採用ノート数
+        pitch_thr : ピッチ検出閾値
+        onset_thr : オンセット検出閾値
+        tempo     : BPM（後処理グリッド量子化用）
+    Returns:
+        [(onset_s, dur_s, midi, vel), ...]
+    """
+    if not HAS_TORCH:
+        _mod_logger.warning("infer_with_light_model: torch 未インストール → 空リスト")
+        return []
+
+    # ① 特徴量抽出 (Mel + CQT + Chroma)
+    fe = FeatureExtractor(sr=sr, hop_length=hop_length)
+    features = fe.extract(audio)                     # (T, 224)
+
+    # ② モデル推論
+    if model is None:
+        model = LightTransformerModel(feature_dim=fe.feature_dim)
+    notes = model.predict(
+        features, top_k=top_k,
+        pitch_thr=pitch_thr, onset_thr=onset_thr,
+        sr=sr, hop_length=hop_length,
+    )
+
+    # ③ 後処理（短音削除・ギャップ補完・グリッド量子化）
+    notes = postprocess_notes(notes, tempo=tempo)
+    _mod_logger.info("infer_with_light_model: %d notes", len(notes))
+    return notes
+
+
+# =====================================================
 # エントリーポイント
 # =====================================================
 
