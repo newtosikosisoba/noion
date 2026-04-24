@@ -4167,6 +4167,92 @@ def infer_with_light_model(audio, sr=44100, hop_length=512,
     return notes
 
 
+def benchmark_light_model(duration_sec=0.5, sr=44100, n_runs=5):
+    """LightTransformerModel の CPU 推論時間・メモリ使用量を計測する。
+
+    ⑨ 軽量化チェック: 推論時間 / メモリ / CPU 動作確認用。
+    GPU が存在しても CPU のみで動作することを確認する。
+
+    Args:
+        duration_sec : ベンチマーク用音声の長さ（秒）
+        sr           : サンプリングレート
+        n_runs       : 計測反復回数（平均を算出）
+    Returns:
+        dict: {
+            "mean_ms"   : 平均推論時間（ミリ秒）,
+            "min_ms"    : 最短推論時間（ミリ秒）,
+            "max_ms"    : 最長推論時間（ミリ秒）,
+            "peak_mb"   : ピークメモリ使用量（MB）,
+            "cpu_only"  : True = CPU のみで動作,
+            "has_torch" : torch インストール済みかどうか,
+            "params"    : モデルパラメータ数,
+        }
+    """
+    import time
+    import tracemalloc
+
+    result = {
+        "mean_ms":  None,
+        "min_ms":   None,
+        "max_ms":   None,
+        "peak_mb":  None,
+        "cpu_only": True,
+        "has_torch": HAS_TORCH,
+        "params":   0,
+    }
+
+    if not HAS_TORCH:
+        _mod_logger.warning("benchmark_light_model: torch 未インストール — スキップ")
+        return result
+
+    import torch
+
+    # ダミー音声 (ランダムノイズ 0.5秒)
+    audio = np.random.randn(int(duration_sec * sr)).astype(np.float32) * 0.1
+
+    # 特徴量抽出
+    fe = FeatureExtractor(sr=sr)
+    features = fe.extract(audio)          # (T, 224)
+
+    # モデル生成 (CPU 固定)
+    model = LightTransformerModel(feature_dim=fe.feature_dim)
+    model.eval()
+
+    # パラメータ数
+    result["params"] = sum(p.numel() for p in model.parameters())
+
+    # CPU 動作確認
+    result["cpu_only"] = not next(model.parameters()).is_cuda
+
+    # ウォームアップ (JIT キャッシュ等を安定させる)
+    _ = model.predict(features)
+
+    # 推論時間計測
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        _ = model.predict(features)
+        times.append(time.perf_counter() - t0)
+
+    result["mean_ms"] = float(np.mean(times) * 1000)
+    result["min_ms"]  = float(np.min(times)  * 1000)
+    result["max_ms"]  = float(np.max(times)  * 1000)
+
+    # ピークメモリ計測
+    tracemalloc.start()
+    _ = model.predict(features)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    result["peak_mb"] = peak / 1e6
+
+    _mod_logger.info(
+        "benchmark_light_model: %.1f ms (mean), %.1f MB peak, CPU=%s, params=%d",
+        result["mean_ms"], result["peak_mb"],
+        result["cpu_only"], result["params"],
+    )
+    return result
+
+
 # =====================================================
 # エントリーポイント
 # =====================================================
