@@ -70,13 +70,13 @@ async def transcribe(
 
     Args:
         file          : アップロード音声ファイル
-        mode          : 処理モード ("ai", "ai_inst", "classic")
+        mode          : 処理モード ("ai", "ai_inst")
         output_format : 出力形式 ("midi" のみ)
     Returns:
         MIDI ファイル (application/octet-stream)
     """
     # バリデーション
-    if mode not in ("ai", "ai_inst", "classic"):
+    if mode not in ("ai", "ai_inst"):
         raise HTTPException(400, f"未対応モード: {mode}")
     if output_format != "midi":
         raise HTTPException(400, f"未対応出力形式: {output_format}")
@@ -156,7 +156,7 @@ async def transcribe_notes(
 
     MIDI ファイルではなく構造化データが必要な場合に使用。
     """
-    if mode not in ("ai", "ai_inst", "classic"):
+    if mode not in ("ai", "ai_inst"):
         raise HTTPException(400, f"未対応モード: {mode}")
 
     suffix = Path(file.filename).suffix if file.filename else ".mp3"

@@ -21,8 +21,6 @@ v7.0 の革新:
   CLI:  python mimikopi.py input.mp3 [-o output.mp3] [--mode MODE]
         MODE: ai (Demucs+BasicPitch / デフォルト)
               ai_inst (AI耳コピ・ガイドメロディなし / カラオケ伴奏向け)
-              karaoke (ボーカル除去のみ / 最高忠実度)
-              classic (v6.0相当 / 軽量)
 """
 
 import os
@@ -887,10 +885,8 @@ class EarCopyEngine:
 
     モード:
       - "ai"      : Demucs でステム分離 → Basic Pitch で多声部採譜 → FluidSynth 合成
-                    （未セットアップ時は v6 加算合成にフォールバック）
+                    （未セットアップ時は CQT+pyin フォールバック）
       - "ai_inst" : ai と同じパイプラインだがボーカルを完全に除去（カラオケ伴奏向け）
-      - "karaoke" : Demucs でボーカル除去のみ（伴奏はそのまま出力、最も原曲に近い）
-      - "classic" : v6.0 同等の CQT+pyin 解析＆加算合成（依存最小）
     """
 
     MIDI_MAP = {
@@ -917,7 +913,7 @@ class EarCopyEngine:
 
     def __init__(self, on_progress=None, mode="ai"):
         self._cb = on_progress
-        self.mode = mode  # "ai" | "ai_inst" | "karaoke" | "classic"
+        self.mode = mode  # "ai" | "ai_inst"
         # 採譜精度モード: "high_recall" | "balanced" | "high_precision"
         self.transcription_quality = "balanced"
 
@@ -1658,67 +1654,7 @@ class EarCopyEngine:
     def process(self, input_path: str, output_path: str):
         """モードに応じて処理を分岐する"""
         try:
-            if self.mode == "classic":
-                return self._process_classic(input_path, output_path)
-            if self.mode == "karaoke":
-                return self._process_karaoke(input_path, output_path)
-            # "ai" または "ai_inst" はAIパイプライン
             return self._process_ai(input_path, output_path)
-        except Exception as e:
-            import traceback
-            self._log(f"エラー: {e}", -1)
-            return False, traceback.format_exc()
-
-    # ---- Classic (v6.0 互換) ----------------------------
-
-    def _process_classic(self, input_path: str, output_path: str):
-        try:
-            y, sr = self._load(input_path)
-            duration = len(y) / sr
-            y_h, y_p = self._hpss(y)
-            tempo, beats = self._tempo(y, sr)
-            self._current_tempo = float(tempo) if tempo else 120.0
-            self._log(f"テンポ: {tempo:.1f} BPM", 20)
-
-            # 4層検出
-            self._log("CQT多声部解析中...", 24)
-            cqt_notes = self._detect_all_notes(y_h, sr)
-            self._log(f"  CQT: {len(cqt_notes)} 音符", 32)
-
-            melody = self._detect_melody(y_h, sr)
-            self._log(f"  メロディ: {len(melody)} 音符", 35)
-
-            bass = self._detect_bass(y_h, sr)
-            self._log(f"  ベース: {len(bass)} 音符", 40)
-
-            chords = self._detect_chords(y_h, sr, beats)
-            self._log(f"  コード: {len(chords)} 進行", 45)
-
-            self._log("ドラム解析中...", 48)
-            drum_events = self._drums(y_p, sr)
-            self._log(f"  ドラム: {len(drum_events)} イベント", 52)
-
-            parts = self._smart_assign(cqt_notes, melody, bass, chords, beats)
-            total = sum(len(v) for v in parts.values())
-            self._log(f"  全パート合計: {total} ノート（15楽器）", 58)
-
-            self._log("15楽器+ドラムで合成中...", 60)
-            n = int((duration + 2.0) * SR)
-            audio = self._synth_parts(parts, n) * 0.75
-            audio += self._synth_drums(drum_events, n) * 0.50
-            peak = np.max(np.abs(audio))
-            if peak > 0:
-                audio = (audio / peak * 0.92).astype(np.float32)
-
-            self._log("MP3を保存中...", 90)
-            self._save_mp3(audio, output_path)
-
-            self._log("MIDIを保存中...", 95)
-            midi_path = str(Path(output_path).with_suffix(".mid"))
-            self._save_midi(parts, drum_events, tempo, midi_path)
-
-            self._log("完了！", 100)
-            return True, output_path
         except Exception as e:
             import traceback
             self._log(f"エラー: {e}", -1)
@@ -1732,8 +1668,7 @@ class EarCopyEngine:
         """Demucs + Basic Pitch の主パイプライン（ハイブリッド合成）"""
         self._log("AIモデル準備中...", 2)
         if not _ensure_ai_packages(lambda m: self._log(m, 3)):
-            self._log("AIパッケージ取得に失敗、Classic モードへフォールバック", 5)
-            return self._process_classic(input_path, output_path)
+            return False, "AIパッケージの取得に失敗しました。pip install demucs basic-pitch を実行してください。"
 
         # 1. 原音ロード
         y, sr = self._load(input_path)
@@ -1743,8 +1678,7 @@ class EarCopyEngine:
         self._log("Demucs でステム分離中 (初回はモデル~80MBをダウンロード)...", 8)
         stems = self._demucs_separate(input_path)
         if stems is None:
-            self._log("Demucs 失敗、Classic モードへフォールバック", 12)
-            return self._process_classic(input_path, output_path)
+            return False, "Demucs でのステム分離に失敗しました。"
 
         # 3. 各ステムから採譜
         tempo, beats = self._tempo(y, sr)
@@ -1976,44 +1910,6 @@ class EarCopyEngine:
         self._log("MP3を保存中...", 94)
         self._save_mp3(audio, output_path)
 
-        self._log("完了！", 100)
-        return True, output_path
-
-    def _process_karaoke(self, input_path: str, output_path: str):
-        """ボーカル除去のみ（原曲クオリティそのまま）"""
-        self._log("AIモデル準備中...", 2)
-        if not _ensure_ai_packages(lambda m: self._log(m, 3)):
-            return False, "AIパッケージが必要です"
-
-        y, sr = self._load(input_path)
-        duration = len(y) / sr
-
-        self._log("Demucs でボーカル分離中...", 15)
-        stems = self._demucs_separate(input_path)
-        if stems is None:
-            return False, "Demucs でのステム分離に失敗しました"
-
-        self._log("伴奏をミックス中...", 75)
-        inst = self._mix_stems(stems, include_vocals=False)
-        inst = self._master(inst)
-
-        self._log("出力品質チェック中...", 91)
-        self._validate_output(inst, duration)
-
-        # MIDI も参考用に出力
-        tempo, _ = self._tempo(y, sr)
-        self._current_tempo = float(tempo) if tempo else 120.0
-        self._log("参考 MIDI を作成中...", 85)
-        bass_notes = self._pyin_bass_notes(stems["bass"], sr)
-        other_notes = self._basic_pitch_notes(stems["other"], sr, is_vocal=False)
-        vocal_notes = self._basic_pitch_notes(stems["vocals"], sr, is_vocal=True)
-        drum_events = self._drums_from_stem(stems["drums"], sr)
-        parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
-        midi_path = str(Path(output_path).with_suffix(".mid"))
-        self._save_midi(parts, drum_events, tempo, midi_path)
-
-        self._log("MP3を保存中...", 94)
-        self._save_mp3(inst, output_path)
         self._log("完了！", 100)
         return True, output_path
 
@@ -3494,8 +3390,6 @@ class App:
         modes = [
             ("ai",      "AI耳コピ (Demucs+BasicPitch) / 推奨"),
             ("ai_inst", "AI耳コピ・ガイドメロディなし (カラオケ伴奏向け)"),
-            ("karaoke", "カラオケ (ボーカル除去のみ / 最高忠実度)"),
-            ("classic", "Classic (v6.0軽量 / AI不要)"),
         ]
         for val, label in modes:
             tk.Radiobutton(
@@ -3650,9 +3544,9 @@ def _run_cli(args):
     )
     parser.add_argument("input", help="入力音楽ファイル（MP3/WAV/M4A/FLAC）")
     parser.add_argument("-o", "--output", help="出力MP3パス（省略時: 同じフォルダに 耳コピ_*.mp3）")
-    parser.add_argument("--mode", choices=["ai", "ai_inst", "karaoke", "classic"],
+    parser.add_argument("--mode", choices=["ai", "ai_inst"],
                         default="ai",
-                        help="処理モード: ai (推奨) / ai_inst (ガイドメロディなし) / karaoke / classic")
+                        help="処理モード: ai (推奨) / ai_inst (ガイドメロディなし)")
     opts = parser.parse_args(args)
 
     inp = Path(opts.input)
