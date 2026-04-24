@@ -1827,7 +1827,52 @@ class EarCopyEngine:
         other_notes = self._extend_sustains(other_notes)
         vocal_notes = self._extend_sustains(vocal_notes)
 
-        # 3f. Velocity はクランプのみ（元のダイナミクスを潰さない）
+        # 3f. 音楽理論補正 (music_theory.py)
+        try:
+            from music_theory import MusicTheoryCorrector
+            self._log("  音楽理論補正中...", 70)
+            mtc = MusicTheoryCorrector(
+                audio=y, sr=sr,
+                tempo=self._current_tempo,
+                beat_times=beats,
+            )
+            if mtc.key_score > 0.3:
+                self._log(f"  推定キー (理論補正): "
+                          f"{mtc.key_root} {mtc.key_mode} "
+                          f"(score={mtc.key_score:.2f})", 70)
+            vocal_notes = mtc.correct(
+                vocal_notes,
+                apply_bass=False,
+                max_polyphony=2,
+                quantize_strength=0.4,
+                confidence_threshold=0.25,
+            )
+            other_notes = mtc.correct(
+                other_notes,
+                apply_bass=False,
+                max_polyphony=6,
+                quantize_strength=0.6,
+                confidence_threshold=0.30,
+            )
+            bass_notes = mtc.correct(
+                bass_notes,
+                apply_scale=False,
+                apply_chord=False,
+                apply_harmony=False,
+                apply_bass=True,
+                quantize_strength=0.5,
+                confidence_threshold=0.20,
+            )
+            self._log(f"  理論補正完了: "
+                      f"vocal={len(vocal_notes)} "
+                      f"other={len(other_notes)} "
+                      f"bass={len(bass_notes)}", 71)
+        except ImportError:
+            pass  # music_theory.py が無くても既存動作に影響なし
+        except Exception as e:
+            self._log(f"  音楽理論補正スキップ: {e}", 71)
+
+        # 3g. Velocity はクランプのみ（元のダイナミクスを潰さない）
         vocal_notes = self._normalize_velocity(vocal_notes, 50, 120)
         other_notes = self._normalize_velocity(other_notes, 35, 115)
         bass_notes  = self._normalize_velocity(bass_notes,  55, 120)
@@ -3866,6 +3911,18 @@ def infer_with_separation(input_path, output_midi_path=None,
         tempo = 120.0
     notes = postprocess_notes(notes, tempo=tempo)
 
+    # ④-b 音楽理論補正
+    try:
+        from music_theory import correct_notes as _mt_correct
+        beat_arr = _beats if '_beats' in dir() and _beats is not None else None
+        notes = _mt_correct(notes, audio=other_audio, sr=sr_use,
+                            tempo=tempo, beat_times=beat_arr)
+        _mod_logger.info("  音楽理論補正後: %d ノート", len(notes))
+    except ImportError:
+        pass
+    except Exception as e:
+        _mod_logger.debug("  音楽理論補正スキップ: %s", e)
+
     # ⑤ MIDI 保存 (オプション)
     if output_midi_path:
         export_midi(notes, output_midi_path, tempo=tempo)
@@ -4163,6 +4220,16 @@ def infer_with_light_model(audio, sr=44100, hop_length=512,
 
     # ③ 後処理（短音削除・ギャップ補完・グリッド量子化）
     notes = postprocess_notes(notes, tempo=tempo)
+
+    # ④ 音楽理論補正
+    try:
+        from music_theory import correct_notes as _mt_correct
+        notes = _mt_correct(notes, audio=audio, sr=sr, tempo=tempo)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
     _mod_logger.info("infer_with_light_model: %d notes", len(notes))
     return notes
 
