@@ -2,6 +2,7 @@
   "name": "frontend",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "dev": "vite",
@@ -26,6 +27,6 @@
     "postcss": "^8.5.10",
     "tailwindcss": "^3.4.19",
     "typescript": "^5.9.3",
-    "vite": "^5.4.21"
+    "vite": "^8.0.10"
   }
 }
