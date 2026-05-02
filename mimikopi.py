@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 耳コピ自動生成ツール v7.0
-MP3をドラッグ&ドロップするだけで原曲忠実な耳コピ音源を自動作成
+MP3をドラッグ&ドロップするだけで100% MIDI再合成・原盤不使用の耳コピ音源を自動作成
+
+【著作権・原盤権ポリシー】
+  本ツールは原曲音源を再配布しません。MIDI採譜後にサンプル音源 (SoundFont) で
+  再合成した「自分の演奏」のみを出力します。Demucs で分離した原音ステムは
+  MIDI 採譜の入力と評価スコア算出にのみ使用し、最終 WAV/MP3 には一切混合しません。
 
 v7.0 の革新:
-  - Demucs (Meta): ボーカル/ドラム/ベース/その他の AI ステム分離
+  - Demucs (Meta): ボーカル/ドラム/ベース/その他の AI ステム分離 (採譜入力専用)
   - Basic Pitch (Spotify): SOTA 多声部ポリフォニック MIDI 採譜
-  - FluidSynth + SoundFont: 本物のサンプル音源による再合成
-  - ハイブリッドミックス: 合成MIDI音源に原音ステムをRMS正規化ブレンド
+  - FluidSynth + SoundFont: 本物のサンプル音源による100% 再合成
   - キー推定＆スケールスナップ: ボーカル音程のAI自動補正
   - 出力品質チェック: 長さ/音量/スペクトル/クリッピングの自動検証
-  - v6.0 の加算合成はフォールバックとして残存
 
 必要環境: Python 3.8+
 初回起動時に依存パッケージを自動インストールします（AIモード時は約1-2GB）
@@ -881,7 +884,11 @@ SEMI = 2 ** (1 / 12)
 
 
 class EarCopyEngine:
-    """v7.0 - Demucs + Basic Pitch + FluidSynth を主軸とした原曲忠実エンジン
+    """v7.0 - Demucs + Basic Pitch + FluidSynth を主軸とした 100% MIDI再合成エンジン。
+
+    出力ポリシー:
+      最終 WAV/MP3 は FluidSynth 合成音のみで構成し、Demucs で分離した
+      原音ステムは一切混入しない (原盤権侵害の防止)。
 
     モード:
       - "ai"      : Demucs でステム分離 → Basic Pitch で多声部採譜 → FluidSynth 合成
@@ -1665,7 +1672,11 @@ class EarCopyEngine:
     # ============================================================
 
     def _process_ai(self, input_path: str, output_path: str):
-        """Demucs + Basic Pitch の主パイプライン（ハイブリッド合成）"""
+        """Demucs + Basic Pitch の主パイプライン（100% MIDI再合成・原盤不使用）。
+
+        Demucs ステムは MIDI 採譜の入力と評価スコア算出にのみ使用し、
+        最終出力 WAV/MP3 には一切混合しない（原盤権侵害の防止）。
+        """
         self._log("AIモデル準備中...", 2)
         if not _ensure_ai_packages(lambda m: self._log(m, 3)):
             return False, "AIパッケージの取得に失敗しました。pip install demucs basic-pitch を実行してください。"
@@ -1896,9 +1907,17 @@ class EarCopyEngine:
         self._log("音声合成中...", 82)
         synth_audio = self._synthesize_audio(midi_path, parts, drum_events, duration)
 
-        # 著作権保護: 合成音のみ使用（元の音源ステムは一切含めない）
+        # 原盤権保護: 合成音のみ使用（Demucs ステムは最終出力に一切含めない）
         self._log("マスタリング中...", 88)
         audio = synth_audio.copy()
+
+        # 採譜・評価が完了したので Demucs 由来の原音ステムを破棄する。
+        # メモリ上の派生物をユーザー環境に残さないことで原盤権侵害を防ぐ。
+        try:
+            stems.clear()
+        except Exception:
+            pass
+        del stems
 
         # --- ステージ8: マスタリング ---
         audio = self._master(audio)
@@ -1916,7 +1935,13 @@ class EarCopyEngine:
     # ---- Demucs ステム分離 --------------------------------
 
     def _demucs_separate(self, input_path):
-        """Demucs (htdemucs) でステム分離し、dict{name: ndarray} を返す"""
+        """Demucs (htdemucs) でステム分離し、dict{name: ndarray} を返す。
+
+        ⚠ 原盤権ポリシー: 返却される ndarray は MIDI 採譜の入力と
+        評価スコア算出にのみ使用すること。最終 WAV/MP3 への混入は禁止。
+        ステムはディスクに保存せずメモリ内のみで保持し、_process_ai 終了時に
+        破棄される。
+        """
         try:
             import torch
             from demucs.pretrained import get_model
@@ -1960,20 +1985,8 @@ class EarCopyEngine:
             traceback.print_exc()
             return None
 
-    def _mix_stems(self, stems, include_vocals=True, gains=None):
-        """ステムをモノミックスする"""
-        if gains is None:
-            gains = {"drums": 1.0, "bass": 1.0, "other": 1.0, "vocals": 1.0}
-        if not include_vocals:
-            gains = {**gains, "vocals": 0.0}
-        max_len = max(len(s) for s in stems.values())
-        mix = np.zeros(max_len, dtype=np.float32)
-        for name, s in stems.items():
-            g = gains.get(name, 1.0)
-            if g == 0 or len(s) == 0:
-                continue
-            mix[:len(s)] += s * g
-        return mix
+    # 旧 _mix_stems (Demucs 出力をミックスする関数) は v7.x で削除。
+    # 原盤権侵害防止のため、ステムを混合するヘルパは提供しない。
 
     # ---- Basic Pitch 多声部採譜 ---------------------------
 
@@ -2550,58 +2563,10 @@ class EarCopyEngine:
                     pass
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    # ---- ハイブリッドミックス＆マスタリング ----------------
-
-    def _hybrid_mix(self, synth_audio, stems):
-        """合成音にドラム/ベース/other原音ステムをRMS正規化して加算する。
-
-        ステレオ対応: FluidSynth出力がステレオ(N,2)の場合はステレオ維持。
-        モノステムはセンターパンとしてステレオに展開してから加算。
-        """
-        is_stereo = synth_audio.ndim == 2
-        n = len(synth_audio)
-        out = synth_audio.copy().astype(np.float32)
-
-        if is_stereo:
-            rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
-        else:
-            rms_synth = float(np.sqrt(np.mean(synth_audio ** 2) + 1e-9))
-
-        def _add_stem(stem, target_ratio, kind=None):
-            if stem is None or len(stem) == 0 or rms_synth <= 1e-6:
-                return
-            seg = stem[:n] if len(stem) >= n else np.pad(stem, (0, n - len(stem)))
-            nyq = SR / 2
-            if kind == "drums":
-                b, a = butter(2, 80 / nyq, btype="high")
-                seg = filtfilt(b, a, seg).astype(np.float32)
-            elif kind == "bass":
-                b, a = butter(2, 300 / nyq, btype="low")
-                seg = filtfilt(b, a, seg).astype(np.float32)
-            rms_stem = float(np.sqrt(np.mean(seg ** 2) + 1e-9))
-            if rms_stem <= 1e-6:
-                return
-            gain = (rms_synth * target_ratio) / rms_stem
-            peak = float(np.max(np.abs(seg)))
-            if peak * gain > 0.95:
-                gain = 0.95 / max(peak, 1e-6)
-            # ステム境界のクリック防止: raised-cosine フェード (30ms)
-            fade_len = min(int(0.03 * SR), len(seg) // 4)
-            if fade_len > 0:
-                fade_in = 0.5 * (1 - np.cos(np.linspace(0, np.pi, fade_len))).astype(np.float32)
-                fade_out = fade_in[::-1]
-                seg = seg.copy()
-                seg[:fade_len] *= fade_in
-                seg[-fade_len:] *= fade_out
-            if is_stereo:
-                out[:n] += np.column_stack([seg * gain, seg * gain])
-            else:
-                out[:n] += seg * gain
-
-        _add_stem(stems.get("drums"), target_ratio=0.85, kind="drums")
-        _add_stem(stems.get("bass"),  target_ratio=0.50, kind="bass")
-        _add_stem(stems.get("other"), target_ratio=0.25, kind="other")
-        return out
+    # ---- マスタリング --------------------------------------
+    # 原盤権侵害防止のため、原音ステムを最終出力にミックスする経路は
+    # 一切設けない (旧 _hybrid_mix は v7.x で削除)。最終 WAV/MP3 は
+    # FluidSynth の合成音 (synth_audio) のみで構成する。
 
     def _master(self, audio):
         """マスタリング: DC除去 → HP/LP EQ → コンプレッサー → ソフトクリップ
@@ -3361,6 +3326,8 @@ class App:
                  bg=self.BG, fg=self.ACCENT).pack(pady=(20, 4))
         tk.Label(r, text="Demucs × Basic Pitch × FluidSynth で原曲忠実な耳コピ",
                  font=("Helvetica", 9), bg=self.BG, fg=self.FG2).pack()
+        tk.Label(r, text="※ 100% MIDI再合成・原盤不使用 (原曲音源は出力に含まれません)",
+                 font=("Helvetica", 8), bg=self.BG, fg=self.FG2).pack()
 
         # ドロップゾーン
         self._drop_frame = tk.Frame(r, bg=self.BG2, relief="flat", bd=0)
@@ -3540,7 +3507,11 @@ def _run_cli(args):
     """コマンドライン引数で直接処理を実行する"""
     import argparse
     parser = argparse.ArgumentParser(
-        description="耳コピ自動生成ツール v7.0 - Demucs×BasicPitch×FluidSynth"
+        description=(
+            "耳コピ自動生成ツール v7.0 - Demucs×BasicPitch×FluidSynth\n"
+            "本ツールは原曲音源を再配布しません。MIDI採譜後にサンプル音源で"
+            "再合成した出力のみを生成します（原盤権保護）。"
+        )
     )
     parser.add_argument("input", help="入力音楽ファイル（MP3/WAV/M4A/FLAC）")
     parser.add_argument("-o", "--output", help="出力MP3パス（省略時: 同じフォルダに 耳コピ_*.mp3）")
@@ -3871,6 +3842,13 @@ def infer_with_separation(input_path, output_midi_path=None,
     if output_midi_path:
         export_midi(notes, output_midi_path, tempo=tempo)
         _mod_logger.info("  MIDI 保存: %s", output_midi_path)
+
+    # 原盤権保護: 採譜が完了したので Demucs 由来の原音ステムを破棄する
+    try:
+        if stems is not None:
+            stems.clear()
+    except Exception:
+        pass
 
     return notes
 
