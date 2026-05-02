@@ -551,6 +551,17 @@ _SF2_DOWNLOADS = [
      140, "sf2"),
 ]
 
+# 高品質ピアノ専用 SoundFont (CC-BY 3.0, Alexander Holm)
+# Salamander Grand Piano: Yamaha C5 からサンプリングした 48kHz 16bit ピアノ
+_PIANO_SF2_DOWNLOADS = [
+    ("Salamander Grand Piano v3 SF2 (FreePats)",
+     "https://freepats.zenvoid.org/Piano/SalamanderGrandPiano/SalamanderGrandPianoV3+20161209_48khz24bit.sf2",
+     400, "sf2"),
+]
+
+# instruments.json ベースの楽器→SF2マッピング設定パス
+_INSTRUMENTS_JSON = Path(__file__).parent / "instruments.json"
+
 _SF2_QUALITY_KEYWORDS = [
     ("generaluser",     100),
     ("musescore_gen",    95),
@@ -700,6 +711,104 @@ def _download_sf2(log=print):
             log(f"  ✗ {name} 取得失敗: {e}")
             continue
     return None
+
+
+def _find_piano_sf2():
+    """ピアノ専用 SoundFont を探す (Salamander 優先)"""
+    for ext in ("*.sf2", "*.sf3"):
+        for p in _ASSETS_DIR.glob(ext):
+            if "salamander" in p.name.lower() or "piano" in p.name.lower():
+                return str(p)
+    return None
+
+
+def _download_piano_sf2(log=print):
+    """Salamander Grand Piano SF2 をダウンロード (CC-BY 3.0, Alexander Holm)"""
+    _ASSETS_DIR.mkdir(exist_ok=True)
+    import urllib.request
+    for name, url, size, ext in _PIANO_SF2_DOWNLOADS:
+        log(f"  ピアノ SoundFont をダウンロード中 ({name}, 約{size}MB)...")
+        try:
+            fname = f"SalamanderGrandPiano.{ext}"
+            dest = _ASSETS_DIR / fname
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (EarCopyTool)"
+            })
+            with urllib.request.urlopen(req, timeout=120) as r:
+                ct = r.headers.get("Content-Type", "").lower()
+                if "text/html" in ct:
+                    raise RuntimeError(f"HTML応答 (Content-Type: {ct})")
+                data = r.read()
+            if len(data) < 1_000_000:
+                raise RuntimeError(f"サイズ不正 ({len(data)} bytes)")
+            dest.write_bytes(data)
+            if len(data) > 16 and data[:4] == b"RIFF":
+                log(f"  ✓ {dest.name}")
+                return str(dest)
+            dest.unlink(missing_ok=True)
+        except Exception as e:
+            log(f"  ✗ {name}: {e}")
+    return None
+
+
+def _load_instrument_config():
+    """instruments.json を読み込み、楽器グループ→SF2 マッピングを返す"""
+    if not _INSTRUMENTS_JSON.exists():
+        return None
+    try:
+        return json.loads(_INSTRUMENTS_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _resolve_sf2_for_group(group_cfg, config):
+    """楽器グループ設定から使用するSF2パスを解決する"""
+    sf2_key = group_cfg.get("sf2_key", "general")
+    fallback_key = group_cfg.get("fallback_sf2_key", "general")
+
+    if sf2_key == "salamander_piano":
+        piano_sf2 = _find_piano_sf2()
+        if piano_sf2:
+            return piano_sf2
+        if fallback_key != sf2_key:
+            return _find_sf2()
+    return _find_sf2()
+
+
+def _generate_license_readme():
+    """使用中の SoundFont / IR のライセンス情報を README_LICENSES.txt に出力する"""
+    config = _load_instrument_config()
+    if not config:
+        return
+    lines = [
+        "# Noion - 使用ライセンス一覧",
+        "# 自動生成ファイル — 手動編集不要",
+        "",
+        "## SoundFont ライセンス",
+        "",
+    ]
+    for key, info in config.get("soundfonts", {}).items():
+        lines.append(f"### {info.get('description', key)}")
+        lines.append(f"- ライセンス: {info.get('license', '不明')}")
+        lines.append(f"- 作者: {info.get('author', '不明')}")
+        lines.append(f"- URL: {info.get('url', '')}")
+        if info.get("credit_required"):
+            lines.append("- ⚠ クレジット表記が必要")
+        lines.append("")
+    lines.append("## インパルスレスポンス (リバーブ)")
+    lines.append("")
+    for key, info in config.get("impulse_responses", {}).items():
+        lines.append(f"### {info.get('description', key)}")
+        lines.append(f"- ライセンス: {info.get('license', 'CC0')}")
+        lines.append("")
+    lines.append("---")
+    lines.append("本ツールは原曲音源を再配布しません。MIDI採譜後にサンプル音源で")
+    lines.append("再合成した出力のみを生成します。")
+    readme_path = Path(__file__).parent / "README_LICENSES.txt"
+    try:
+        readme_path.write_text("\n".join(lines), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _prompt_sf2_manually(log=print):
@@ -1880,6 +1989,12 @@ class EarCopyEngine:
         self._log("15楽器パートに割り当て中...", 72)
         parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
 
+        # --- ステージ4.5: 生産品質ヒューマナイズ ---
+        self._log("生産品質ヒューマナイズ中...", 73)
+        parts, drum_events = self._production_humanize(
+            parts, drum_events, tempo, beats, seed=42
+        )
+
         # --- ステージ5: MIDI 保存 ---
         self._log("MIDIを保存中...", 75)
         midi_path = str(Path(output_path).with_suffix(".mid"))
@@ -1928,6 +2043,16 @@ class EarCopyEngine:
         # --- ステージ9: 保存 ---
         self._log("MP3を保存中...", 94)
         self._save_mp3(audio, output_path)
+
+        # LUFS 測定
+        lufs = self._measure_lufs(audio)
+        self._log(f"出力ラウドネス: {lufs:.1f} LUFS (目標: -14 LUFS)", 97)
+
+        # ライセンスファイル自動生成
+        try:
+            _generate_license_readme()
+        except Exception:
+            pass
 
         self._log("完了！", 100)
         return True, output_path
@@ -2391,37 +2516,415 @@ class EarCopyEngine:
                 snapped.append((t, dur, midi, vel))
         return snapped
 
-    # ---- 合成 (FluidSynth 優先) ---------------------------
+    # ---- ベロシティ & タイミング ヒューマナイズ (生産品質) ----
+
+    # 楽器グループ別タイミングジッター (秒)
+    _TIMING_JITTER = {
+        'drums': 0.003,
+        'bass': 0.005,
+        'piano': 0.010, 'e_piano': 0.010,
+        'guitar_nylon': 0.010, 'guitar_clean': 0.010,
+        'violin': 0.012, 'viola': 0.012, 'cello': 0.012,
+        'strings': 0.012, 'choir': 0.015,
+        'trumpet': 0.008, 'flute': 0.010,
+        'organ': 0.006, 'glockenspiel': 0.008, 'pad': 0.015,
+    }
+
+    def _production_humanize(self, parts, drum_events, tempo, beats, seed=42):
+        """生産品質のヒューマナイズ: 拍アクセント・ランダム揺らぎ・フレーズ末尾減衰・タイミングずれ"""
+        rng = np.random.RandomState(seed)
+        beat_times = np.array(beats) if beats is not None and len(beats) > 0 else np.array([])
+        beat_interval = 60.0 / max(tempo, 60.0) if tempo else 0.5
+
+        def _is_downbeat(t):
+            if len(beat_times) == 0:
+                return (t % (beat_interval * 4)) < beat_interval * 0.15
+            diffs = np.abs(beat_times - t)
+            return float(np.min(diffs)) < 0.05 if len(diffs) > 0 else False
+
+        def _is_offbeat(t):
+            if len(beat_times) == 0:
+                phase = (t % beat_interval) / beat_interval
+                return 0.35 < phase < 0.65
+            closest_idx = int(np.argmin(np.abs(beat_times - t))) if len(beat_times) > 0 else 0
+            if closest_idx < len(beat_times):
+                offset = abs(t - beat_times[closest_idx])
+                return offset > beat_interval * 0.35
+            return False
+
+        new_parts = {}
+        for name, notes in parts.items():
+            if not notes:
+                new_parts[name] = notes
+                continue
+            jitter_s = self._TIMING_JITTER.get(name, 0.010)
+            humanized = []
+            n_notes = len(notes)
+            for i, (t, dur, midi, vel) in enumerate(notes):
+                # タイミングずれ
+                dt = rng.uniform(-jitter_s, jitter_s)
+                new_t = max(0.0, t + dt)
+                # 拍アクセント
+                if _is_downbeat(t):
+                    vel = min(127, vel + 5)
+                elif _is_offbeat(t):
+                    vel = max(20, vel - 3)
+                # ランダムベロシティ揺らぎ
+                vel = int(np.clip(vel + rng.randint(-8, 9), 20, 127))
+                # フレーズ末尾減衰 (パート内最後3音)
+                tail_pos = n_notes - i
+                if tail_pos <= 3:
+                    decay = [0.85, 0.70, 0.55][tail_pos - 1]
+                    vel = max(20, int(vel * decay))
+                humanized.append((new_t, dur, midi, vel))
+            new_parts[name] = humanized
+
+        # ドラムのヒューマナイズ
+        new_drums = []
+        for evt in drum_events:
+            onset, kind = evt[0], evt[1]
+            vel = evt[2] if len(evt) > 2 else 100
+            dt = rng.uniform(-0.003, 0.003)
+            onset = max(0.0, onset + dt)
+            if _is_downbeat(evt[0]):
+                vel = min(127, vel + 5)
+            vel = int(np.clip(vel + rng.randint(-8, 9), 25, 127))
+            new_drums.append((onset, kind, vel))
+
+        return new_parts, new_drums
+
+    # ---- マルチSoundFont 合成 ----------------------------
+
+    def _split_midi_by_channels(self, midi_path, channels, output_path):
+        """MIDIファイルから指定チャンネルのみ抽出して新ファイルに保存"""
+        try:
+            import mido
+        except ImportError:
+            return False
+        try:
+            mid = mido.MidiFile(midi_path)
+            out = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
+            ch_set = set(channels)
+            for track in mid.tracks:
+                new_track = mido.MidiTrack()
+                for msg in track:
+                    if msg.is_meta:
+                        new_track.append(msg.copy())
+                    elif hasattr(msg, "channel") and msg.channel in ch_set:
+                        new_track.append(msg.copy())
+                    elif hasattr(msg, "channel"):
+                        new_track.append(mido.Message(
+                            "note_off", channel=msg.channel,
+                            note=0, velocity=0, time=msg.time
+                        ))
+                    else:
+                        new_track.append(msg.copy())
+                out.tracks.append(new_track)
+            out.save(output_path)
+            return True
+        except Exception:
+            return False
+
+    def _render_with_sf2(self, midi_path, sf2_path, duration):
+        """指定SF2でMIDIをFluidSynthレンダリングし、ndarray を返す"""
+        fs_bin = _ensure_fluidsynth_cli(lambda m: None)
+        if fs_bin is None:
+            return None
+        work_dir = Path(tempfile.mkdtemp(prefix="earcopy_msf2_"))
+        ascii_midi = work_dir / "in.mid"
+        ascii_wav = work_dir / "out.wav"
+        ascii_sf2 = work_dir / "font.sf2"
+        try:
+            shutil.copy(midi_path, ascii_midi)
+            try:
+                ascii_sf2.symlink_to(sf2_path)
+            except (OSError, NotImplementedError):
+                shutil.copy(sf2_path, ascii_sf2)
+            timeout_sec = max(300, int(duration * 8))
+            cmd = [
+                fs_bin, "-ni", "-F", str(ascii_wav),
+                "-r", str(SR), "-g", "0.85",
+                "-R", "0", "-C", "0", "-T", "wav",
+                str(ascii_sf2), str(ascii_midi),
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace")
+            proc.communicate(timeout=timeout_sec)
+            if not ascii_wav.exists() or ascii_wav.stat().st_size < 1000:
+                return None
+            audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=False)
+            if audio.ndim == 2:
+                audio = audio.T.astype(np.float32)
+            return audio
+        except Exception:
+            return None
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _synthesize_multi_sf2(self, midi_path, duration):
+        """楽器グループごとに最適なSF2でレンダリングし、パートEQ・空間処理付きでミックス"""
+        config = _load_instrument_config()
+        if config is None:
+            return None
+        groups = config.get("instrument_groups", {})
+
+        general_sf2 = _find_sf2()
+        if general_sf2 is None:
+            return None
+
+        piano_sf2 = _find_piano_sf2()
+        rendered_groups = {}
+        work_dir = Path(tempfile.mkdtemp(prefix="earcopy_multi_"))
+
+        try:
+            for gname, gcfg in groups.items():
+                channels = gcfg.get("channels", [])
+                if not channels:
+                    continue
+                sf2_key = gcfg.get("sf2_key", "general")
+                if sf2_key == "salamander_piano" and piano_sf2:
+                    sf2 = piano_sf2
+                else:
+                    sf2 = general_sf2
+
+                group_midi = str(work_dir / f"{gname}.mid")
+                if not self._split_midi_by_channels(midi_path, channels, group_midi):
+                    continue
+                audio = self._render_with_sf2(group_midi, sf2, duration)
+                if audio is not None and np.max(np.abs(audio)) > 1e-6:
+                    rendered_groups[gname] = (audio, gcfg)
+
+            if not rendered_groups:
+                return None
+
+            self._log(f"  マルチSF2: {len(rendered_groups)}グループ合成完了", 87)
+
+            # IRの準備
+            hall_ir, room_ir = self._ensure_ir_files()
+
+            # 各グループにパートEQ + 空間処理を適用してミックス
+            target_len = max(len(a) for a, _ in rendered_groups.values())
+            if rendered_groups and next(iter(rendered_groups.values()))[0].ndim == 2:
+                mix = np.zeros((target_len, 2), dtype=np.float32)
+            else:
+                mix = np.zeros(target_len, dtype=np.float32)
+
+            for gname, (audio, gcfg) in rendered_groups.items():
+                # パートEQ
+                audio = self._apply_part_eq(audio, gcfg.get("eq", {}))
+                # ステレオワイドニング
+                width = gcfg.get("stereo_width", 1.0)
+                audio = self._stereo_widen(audio, width)
+                # パートリバーブ (コンボリューション)
+                reverb_send = gcfg.get("reverb_send", 0.15)
+                if reverb_send > 0 and hall_ir is not None:
+                    ir = room_ir if gname in ("drums", "bass") else hall_ir
+                    if ir is not None:
+                        audio = self._convolution_reverb(audio, ir, reverb_send)
+                # 長さ合わせてミックス
+                n = min(len(audio), target_len)
+                if audio.ndim == mix.ndim:
+                    mix[:n] += audio[:n]
+                elif audio.ndim == 1 and mix.ndim == 2:
+                    mix[:n, 0] += audio[:n]
+                    mix[:n, 1] += audio[:n]
+                elif audio.ndim == 2 and mix.ndim == 1:
+                    mix[:n] += audio[:n].mean(axis=1)
+
+            return mix.astype(np.float32)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     def _synthesize_audio(self, midi_path, parts, drum_events, duration):
-        """FluidSynth で合成、失敗時は v6 加算合成にフォールバック"""
+        """マルチSF2合成を試み、失敗時は単一SF2、最終フォールバックは v6 加算合成"""
+        # マルチSF2
+        audio = self._synthesize_multi_sf2(midi_path, duration)
+        if audio is not None:
+            return audio
+
+        # 単一SF2フォールバック
         audio = self._synthesize_fluidsynth(midi_path, duration)
         if audio is not None:
-            try:
-                from scipy.signal import iirpeak
-                b, a = iirpeak(2500 / (SR / 2), Q=1.0)
-                if audio.ndim == 2:
-                    for ch in range(audio.shape[1]):
-                        boosted = filtfilt(b, a, audio[:, ch]).astype(np.float32)
-                        audio[:, ch] = audio[:, ch] * 0.80 + boosted * 0.20
-                else:
-                    boosted = filtfilt(b, a, audio).astype(np.float32)
-                    audio = (audio * 0.80 + boosted * 0.20).astype(np.float32)
-            except Exception:
-                pass
-            # M/S ステレオ幅拡張: FluidSynth の狭いステレオイメージを広げる
-            if audio.ndim == 2 and audio.shape[1] == 2:
-                mid  = (audio[:, 0] + audio[:, 1]) * 0.5
-                side = (audio[:, 0] - audio[:, 1]) * 0.5
-                side *= 1.4
-                audio[:, 0] = mid + side
-                audio[:, 1] = mid - side
-            return audio * 0.90
+            return audio
+
+        # v6 加算合成フォールバック
         self._log("  FluidSynth 未使用、v6加算合成を使用", 84)
         n = int((duration + 2.0) * SR)
         audio = self._synth_parts(parts, n) * 0.85
         audio += self._synth_drums(drum_events, n) * 0.55
         return audio
+
+    # ---- パートEQ ------------------------------------------
+
+    def _apply_part_eq(self, audio, eq_cfg):
+        """パート種別に応じた EQ を適用する"""
+        if not eq_cfg:
+            return audio
+        nyq = SR / 2
+
+        def _shelf_filter(audio_1d, freq, gain_db, btype):
+            if abs(gain_db) < 0.5:
+                return audio_1d
+            from scipy.signal import iirpeak
+            w0 = min(freq / nyq, 0.99)
+            try:
+                b, a = iirpeak(w0, Q=0.7)
+                gain = 10 ** (gain_db / 20.0)
+                filtered = filtfilt(b, a, audio_1d).astype(np.float32)
+                return (audio_1d + (filtered - audio_1d) * (gain - 1.0)).astype(np.float32)
+            except Exception:
+                return audio_1d
+
+        def _process_1d(sig):
+            low_db = eq_cfg.get("low_shelf_db", 0)
+            high_db = eq_cfg.get("high_shelf_db", 0)
+            mid_db = eq_cfg.get("mid_db", 0)
+            mid_freq = eq_cfg.get("mid_freq_hz", 2500)
+
+            if low_db != 0:
+                sig = _shelf_filter(sig, 200, low_db, "low")
+            if high_db != 0:
+                sig = _shelf_filter(sig, 8000, high_db, "high")
+            if mid_db != 0:
+                try:
+                    from scipy.signal import iirpeak
+                    w0 = min(mid_freq / nyq, 0.99)
+                    b, a = iirpeak(w0, Q=1.5)
+                    gain = 10 ** (mid_db / 20.0)
+                    filtered = filtfilt(b, a, sig).astype(np.float32)
+                    sig = (sig + (filtered - sig) * (gain - 1.0)).astype(np.float32)
+                except Exception:
+                    pass
+            return sig
+
+        if audio.ndim == 2:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _process_1d(audio[:, ch])
+        else:
+            audio = _process_1d(audio)
+        return audio
+
+    # ---- ステレオワイドニング --------------------------------
+
+    def _stereo_widen(self, audio, width=1.0):
+        """M/S 方式のステレオ幅調整。width=0でモノ、1.0で変化なし、>1で広がる"""
+        if audio.ndim != 2 or audio.shape[1] != 2:
+            return audio
+        mid = (audio[:, 0] + audio[:, 1]) * 0.5
+        side = (audio[:, 0] - audio[:, 1]) * 0.5
+        side *= width
+        audio = np.column_stack([mid + side, mid - side]).astype(np.float32)
+        return audio
+
+    # ---- コンボリューション・リバーブ (FFT) -----------------
+
+    def _ensure_ir_files(self):
+        """ホール/ルーム IR ファイルを生成して返す (CC0 アルゴリズム生成)"""
+        ir_dir = _ASSETS_DIR / "ir"
+        ir_dir.mkdir(parents=True, exist_ok=True)
+        hall_path = ir_dir / "hall.npy"
+        room_path = ir_dir / "room.npy"
+
+        if hall_path.exists() and room_path.exists():
+            try:
+                return np.load(str(hall_path)), np.load(str(room_path))
+            except Exception:
+                pass
+
+        hall_ir = self._generate_synthetic_ir(
+            duration=2.2, decay_time=2.0, predelay_ms=25,
+            density=0.8, damping=0.4, seed=1001
+        )
+        room_ir = self._generate_synthetic_ir(
+            duration=0.8, decay_time=0.6, predelay_ms=8,
+            density=0.5, damping=0.6, seed=1002
+        )
+        try:
+            np.save(str(hall_path), hall_ir)
+            np.save(str(room_path), room_ir)
+        except Exception:
+            pass
+        return hall_ir, room_ir
+
+    def _generate_synthetic_ir(self, duration=2.0, decay_time=1.8,
+                               predelay_ms=20, density=0.7,
+                               damping=0.4, seed=42):
+        """アルゴリズムによるインパルスレスポンス生成 (CC0, パブリックドメイン)。
+
+        指数減衰ノイズ + 初期反射 + ハイカットダンピングで
+        自然なリバーブテイルを構築する。ステレオ (N,2) で返す。
+        """
+        rng = np.random.RandomState(seed)
+        n_samples = int(duration * SR)
+        predelay_samples = int(predelay_ms * SR / 1000)
+
+        ir = np.zeros((n_samples, 2), dtype=np.float32)
+
+        # 初期反射 (6本)
+        early_delays = [int(d * SR / 1000) for d in [5, 11, 17, 23, 31, 37]]
+        early_gains = [0.7, 0.55, 0.45, 0.35, 0.28, 0.22]
+        for i, (d, g) in enumerate(zip(early_delays, early_gains)):
+            pos = predelay_samples + d
+            if pos < n_samples:
+                pan = 0.3 + 0.4 * (i % 2)
+                ir[pos, 0] += g * (1 - pan)
+                ir[pos, 1] += g * pan
+
+        # 拡散テイル (指数減衰ノイズ)
+        t = np.arange(n_samples) / SR
+        envelope = np.exp(-t * (3.0 / max(decay_time, 0.1)))
+        tail_start = predelay_samples + early_delays[-1] + int(0.01 * SR)
+        for ch in range(2):
+            noise = rng.randn(n_samples).astype(np.float32) * density * 0.3
+            # ダンピング (ハイカット)
+            cutoff = min((1.0 - damping) * 12000, SR / 2 - 100) / (SR / 2)
+            cutoff = max(0.01, min(cutoff, 0.99))
+            try:
+                b, a = butter(2, cutoff, btype="low")
+                noise = filtfilt(b, a, noise).astype(np.float32)
+            except Exception:
+                pass
+            noise *= envelope
+            noise[:tail_start] = 0
+            ir[:, ch] += noise
+
+        # 正規化
+        peak = np.max(np.abs(ir))
+        if peak > 1e-6:
+            ir = ir / peak * 0.95
+        return ir.astype(np.float32)
+
+    def _convolution_reverb(self, audio, ir, wet=0.2):
+        """FFT畳み込みリバーブ (CPU軽量)"""
+        from scipy.signal import fftconvolve
+
+        dry = audio.copy()
+        if audio.ndim == 1:
+            reverbed_l = fftconvolve(audio, ir[:, 0], mode="full")[:len(audio)]
+            reverbed_r = fftconvolve(audio, ir[:, 1], mode="full")[:len(audio)]
+            wet_sig = (reverbed_l + reverbed_r) * 0.5
+            # サブベース除去
+            try:
+                b, a = butter(2, 150 / (SR / 2), btype="high")
+                wet_sig = filtfilt(b, a, wet_sig).astype(np.float32)
+            except Exception:
+                pass
+            return ((1 - wet) * audio + wet * wet_sig).astype(np.float32)
+        else:
+            result = dry.copy()
+            for ch in range(min(audio.shape[1], 2)):
+                ir_ch = ir[:, min(ch, ir.shape[1] - 1)]
+                reverbed = fftconvolve(audio[:, ch], ir_ch, mode="full")[:len(audio)]
+                try:
+                    b, a = butter(2, 150 / (SR / 2), btype="high")
+                    reverbed = filtfilt(b, a, reverbed).astype(np.float32)
+                except Exception:
+                    pass
+                result[:, ch] = ((1 - wet) * audio[:, ch] + wet * reverbed).astype(np.float32)
+            return result
+
+    # ---- 合成 (マルチSF2 優先) -----------------------------
 
     def _synthesize_fluidsynth(self, midi_path, duration):
         """FluidSynth CLI で MIDI → WAV → ndarray を実行する
@@ -2563,59 +3066,14 @@ class EarCopyEngine:
                     pass
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    # ---- マスタリング --------------------------------------
+    # ---- マスタリング (プロダクション品質ミックスチェーン) ----
     # 原盤権侵害防止のため、原音ステムを最終出力にミックスする経路は
     # 一切設けない (旧 _hybrid_mix は v7.x で削除)。最終 WAV/MP3 は
     # FluidSynth の合成音 (synth_audio) のみで構成する。
 
-    def _master(self, audio):
-        """マスタリング: DC除去 → HP/LP EQ → コンプレッサー → ソフトクリップ
-        モノ (N,) とステレオ (N,2) の両方に対応。
-        """
-        if len(audio) == 0:
-            return audio.astype(np.float32)
-
-        is_stereo = audio.ndim == 2
-
-        # DC オフセット除去
-        audio = (audio - np.mean(audio, axis=0)).astype(np.float32)
-
-        # 軽いルームリバーブで空間感を統一（L/Rは23サンプルずらしてデコリレーション）
-        try:
-            if is_stereo:
-                audio[:, 0] = self._reverb_signal(
-                    audio[:, 0], room_size=0.35, wet=0.06
-                )
-                shifted = np.pad(audio[:, 1], (23, 0))[:len(audio)]
-                audio[:, 1] = self._reverb_signal(
-                    shifted, room_size=0.35, wet=0.06
-                )
-            else:
-                audio = self._reverb_signal(audio, room_size=0.35, wet=0.06)
-        except Exception:
-            pass
-
-        nyq = SR / 2
-
-        # ハイパス 35Hz
-        b, a = butter(3, 35 / nyq, btype="high")
-        if is_stereo:
-            for ch in range(audio.shape[1]):
-                audio[:, ch] = filtfilt(b, a, audio[:, ch]).astype(np.float32)
-        else:
-            audio = filtfilt(b, a, audio).astype(np.float32)
-
-        # ローパス 18kHz
-        b, a = butter(2, min(18000 / nyq, 0.99), btype="low")
-        if is_stereo:
-            for ch in range(audio.shape[1]):
-                audio[:, ch] = filtfilt(b, a, audio[:, ch]).astype(np.float32)
-        else:
-            audio = filtfilt(b, a, audio).astype(np.float32)
-
-        # RMSベース エンベロープフォロワー付きコンプレッサー（リンクドステレオ）
-        threshold = 0.3
-        ratio = 2.5
+    def _soft_compress(self, audio, threshold_db=-18.0, ratio=3.0):
+        """ソフトニー・エンベロープフォロワー付きコンプレッサー"""
+        threshold = 10 ** (threshold_db / 20.0)
         attack = np.exp(-1 / (SR * 0.005))
         release = np.exp(-1 / (SR * 0.05))
         env = 0.0
@@ -2634,7 +3092,6 @@ class EarCopyEngine:
             else:
                 desired_gain = 1.0
             gain_arr[i:i + block] = desired_gain
-        # 動的メイクアップゲイン: 実際の圧縮量に応じて補償
         avg_gain = float(np.mean(gain_arr))
         if avg_gain > 1e-9:
             makeup_db = max(0.0, min(6.0, -20 * np.log10(avg_gain)))
@@ -2642,18 +3099,124 @@ class EarCopyEngine:
             makeup_db = 3.0
         makeup = 10 ** (makeup_db / 20.0)
         gain_arr *= makeup
-        if is_stereo:
-            audio *= gain_arr[:, np.newaxis]
+        if audio.ndim == 2:
+            audio = audio * gain_arr[:, np.newaxis]
         else:
-            audio *= gain_arr
+            audio = audio * gain_arr
+        return audio.astype(np.float32)
 
-        # ノーマライズ + ソフトニーリミッター
+    def _measure_lufs(self, audio):
+        """ITU-R BS.1770-4 簡易 LUFS 測定 (K-weight フィルタ + ゲーティング)"""
+        # K-weight stage 1: high shelf +4dB at 1681Hz
+        nyq = SR / 2
+        # 簡易 K-weight: 2段の IIR で近似
+        try:
+            from scipy.signal import iirpeak
+            b1, a1 = iirpeak(1681 / nyq, Q=0.7)
+            b2, a2 = butter(2, 38 / nyq, btype="high")
+        except Exception:
+            # フィルタ失敗時は RMS ベースの概算
+            check = audio.mean(axis=1) if audio.ndim == 2 else audio
+            rms = float(np.sqrt(np.mean(check ** 2) + 1e-12))
+            return 20 * np.log10(max(rms, 1e-12)) - 0.691
+
+        if audio.ndim == 2:
+            channels = [audio[:, ch] for ch in range(audio.shape[1])]
+        else:
+            channels = [audio]
+
+        channel_powers = []
+        for ch in channels:
+            # K-weight filtering
+            filtered = filtfilt(b1, a1, ch).astype(np.float32)
+            filtered = filtfilt(b2, a2, filtered).astype(np.float32)
+            # ゲーティング: 400ms ブロック, 75%オーバーラップ
+            block_samples = int(0.4 * SR)
+            step = block_samples // 4
+            blocks = []
+            for i in range(0, len(filtered) - block_samples, step):
+                block = filtered[i:i + block_samples]
+                blocks.append(float(np.mean(block ** 2)))
+            if not blocks:
+                blocks = [float(np.mean(filtered ** 2))]
+            # 絶対ゲート -70 LUFS
+            abs_gate = 10 ** ((-70 + 0.691) / 10.0)
+            gated = [b for b in blocks if b > abs_gate]
+            if not gated:
+                gated = blocks
+            # 相対ゲート -10 dB below ungated
+            ungated_mean = np.mean(gated)
+            rel_gate = ungated_mean * 10 ** (-10 / 10.0)
+            final_blocks = [b for b in gated if b > rel_gate]
+            if not final_blocks:
+                final_blocks = gated
+            channel_powers.append(float(np.mean(final_blocks)))
+
+        # ステレオの場合: G_l = G_r = 1.0
+        mean_power = sum(channel_powers) / len(channel_powers)
+        lufs = -0.691 + 10 * np.log10(max(mean_power, 1e-12))
+        return float(lufs)
+
+    def _lufs_normalize(self, audio, target_lufs=-14.0):
+        """LUFS ベースのラウドネス正規化 (YouTube 基準 -14 LUFS)"""
+        current_lufs = self._measure_lufs(audio)
+        diff_db = target_lufs - current_lufs
+        # 極端な補正は避ける
+        diff_db = max(-20.0, min(20.0, diff_db))
+        gain = 10 ** (diff_db / 20.0)
+        audio = audio * gain
+        # ソフトクリップで True Peak 防止
+        audio = np.where(
+            np.abs(audio) > 0.95,
+            np.sign(audio) * (0.95 + np.tanh((np.abs(audio) - 0.95) * 4) * 0.03),
+            audio
+        ).astype(np.float32)
+        return audio
+
+    def _master(self, audio):
+        """プロダクション品質マスタリングチェーン:
+        DC除去 → HP/LP → コンプ (-18dB, 3:1) → ソフトリミット → -14 LUFS 正規化。
+        モノ (N,) とステレオ (N,2) の両方に対応。
+        """
+        if len(audio) == 0:
+            return audio.astype(np.float32)
+
+        is_stereo = audio.ndim == 2
+        audio = (audio - np.mean(audio, axis=0)).astype(np.float32)
+        nyq = SR / 2
+
+        # ハイパス 35Hz
+        b, a = butter(3, 35 / nyq, btype="high")
+        if is_stereo:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = filtfilt(b, a, audio[:, ch]).astype(np.float32)
+        else:
+            audio = filtfilt(b, a, audio).astype(np.float32)
+
+        # ローパス 18kHz
+        b, a = butter(2, min(18000 / nyq, 0.99), btype="low")
+        if is_stereo:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = filtfilt(b, a, audio[:, ch]).astype(np.float32)
+        else:
+            audio = filtfilt(b, a, audio).astype(np.float32)
+
+        # ソフトコンプレッション (閾値 -18dB, ratio 3:1)
+        audio = self._soft_compress(audio, threshold_db=-18.0, ratio=3.0)
+
+        # ソフトニーリミッター
         peak = np.max(np.abs(audio))
         if peak > 0:
-            audio = audio / peak * 0.94
-        audio = np.where(np.abs(audio) > 0.90,
-            np.sign(audio) * (0.90 + np.tanh((np.abs(audio) - 0.90) * 4) * 0.04),
-            audio).astype(np.float32)
+            audio = audio / peak * 0.96
+        audio = np.where(
+            np.abs(audio) > 0.93,
+            np.sign(audio) * (0.93 + np.tanh((np.abs(audio) - 0.93) * 4) * 0.04),
+            audio
+        ).astype(np.float32)
+
+        # -14 LUFS ラウドネス正規化 (YouTube 基準)
+        audio = self._lufs_normalize(audio, target_lufs=-14.0)
+
         return audio.astype(np.float32)
 
     def _validate_output(self, audio, duration):

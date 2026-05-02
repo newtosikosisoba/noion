@@ -1,0 +1,84 @@
+{
+    "_comment": "楽器グループ → SoundFont マッピング設定。パスが空または未存在の場合は汎用SF2にフォールバック。",
+    "instrument_groups": {
+        "piano": {
+            "channels": [0, 1],
+            "sf2_key": "salamander_piano",
+            "fallback_sf2_key": "general",
+            "eq": {"type": "piano", "low_shelf_db": -2, "high_shelf_db": 3, "mid_freq_hz": 2500, "mid_db": 1.5},
+            "stereo_width": 1.6,
+            "reverb_send": 0.25
+        },
+        "strings": {
+            "channels": [7, 8, 10, 11, 12],
+            "sf2_key": "general",
+            "eq": {"type": "strings", "low_shelf_db": -3, "high_shelf_db": 2, "mid_freq_hz": 3000, "mid_db": 1},
+            "stereo_width": 1.8,
+            "reverb_send": 0.35
+        },
+        "bass": {
+            "channels": [6],
+            "sf2_key": "general",
+            "eq": {"type": "bass", "low_shelf_db": 4, "high_shelf_db": -4, "low_cutoff_hz": 200, "high_cutoff_hz": 2500},
+            "stereo_width": 0.0,
+            "reverb_send": 0.08
+        },
+        "drums": {
+            "channels": [9],
+            "sf2_key": "general",
+            "eq": {"type": "drums", "low_shelf_db": 2, "high_shelf_db": 4, "mid_freq_hz": 800, "mid_db": -2},
+            "stereo_width": 0.8,
+            "reverb_send": 0.15
+        },
+        "guitar": {
+            "channels": [4, 5],
+            "sf2_key": "general",
+            "eq": {"type": "guitar", "low_shelf_db": -1, "high_shelf_db": 2, "mid_freq_hz": 2000, "mid_db": 1},
+            "stereo_width": 1.4,
+            "reverb_send": 0.20
+        },
+        "brass_wind": {
+            "channels": [13, 14],
+            "sf2_key": "general",
+            "eq": {"type": "brass", "low_shelf_db": -2, "high_shelf_db": 1, "mid_freq_hz": 1500, "mid_db": 2},
+            "stereo_width": 1.2,
+            "reverb_send": 0.22
+        },
+        "other": {
+            "channels": [2, 3, 15],
+            "sf2_key": "general",
+            "eq": {"type": "other", "low_shelf_db": -1, "high_shelf_db": 1},
+            "stereo_width": 1.0,
+            "reverb_send": 0.20
+        }
+    },
+    "soundfonts": {
+        "general": {
+            "description": "GeneralUser GS v1.471 — 汎用 GM SoundFont",
+            "license": "CC0 (public domain equivalent)",
+            "author": "Christian Collins",
+            "url": "https://schristiancollins.com/generaluser.php"
+        },
+        "salamander_piano": {
+            "description": "Salamander Grand Piano — 高品質ピアノサンプル (SF2変換版)",
+            "license": "CC-BY 3.0",
+            "author": "Alexander Holm",
+            "url": "https://freepats.zenvoid.org/Piano/SalamanderGrandPiano/",
+            "credit_required": true
+        }
+    },
+    "impulse_responses": {
+        "hall": {
+            "description": "コンサートホール風リバーブ (アルゴリズム生成)",
+            "license": "CC0 (public domain)",
+            "decay_time": 2.2,
+            "predelay_ms": 25
+        },
+        "room": {
+            "description": "スタジオルーム風リバーブ (アルゴリズム生成)",
+            "license": "CC0 (public domain)",
+            "decay_time": 0.8,
+            "predelay_ms": 8
+        }
+    }
+}
