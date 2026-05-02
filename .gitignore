@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 .ffmpeg_path.json
+.fluidsynth_path.json
+.sf2_path.json
+_assets/
 node_modules/
 data/
