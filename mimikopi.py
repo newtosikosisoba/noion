@@ -2901,8 +2901,8 @@ class EarCopyEngine:
         return self._trim_to_duration(audio, duration)
 
     def _trim_to_duration(self, audio, duration):
-        """合成音を原曲の長さ+0.3秒に切り詰める (FluidSynth のリバーブ尾を除去)"""
-        target_len = int((duration + 0.3) * SR)
+        """合成音を原曲の長さ+0.2秒に切り詰める (FluidSynth のリバーブ尾を除去)"""
+        target_len = int((duration + 0.2) * SR)
         if len(audio) > target_len:
             fade_len = min(int(0.05 * SR), target_len)
             audio = audio[:target_len].copy()
