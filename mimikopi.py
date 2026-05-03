@@ -3859,6 +3859,8 @@ class App:
     GREEN   = "#4ade80"
     BLUE    = "#4a90d9"
 
+    _AGREE_FILE = Path.home() / ".mimikopi_agreed"
+
     def __init__(self):
         if HAS_DND:
             self.root = TkinterDnD.Tk()
@@ -3876,7 +3878,86 @@ class App:
         self._mode     = tk.StringVar(value="ai")
         self._busy     = False
 
+        if not self._check_agreement():
+            self.root.destroy()
+            return
+
         self._build()
+
+    # ---- 免責同意ダイアログ --------------------------------
+
+    def _check_agreement(self):
+        if self._AGREE_FILE.exists():
+            return True
+
+        DISCLAIMER = (
+            "【利用上の注意・免責事項】\n\n"
+            "本ツールは、入力された音楽ファイルをAIで解析し、\n"
+            "MIDIデータに変換した上でサンプル音源により再合成します。\n"
+            "出力に原曲の録音物（原盤）は一切含まれません。\n\n"
+            "ただし、生成された楽曲を公開・配信する場合、\n"
+            "楽曲の著作権（作詞・作曲）に関する許諾が\n"
+            "別途必要になる場合があります。\n\n"
+            "● JASRAC / NexTone 管理楽曲の場合:\n"
+            "  YouTube・ニコニコ動画等の包括契約対象サービスでは\n"
+            "  追加手続き不要で「歌ってみた」等に利用できます。\n"
+            "  それ以外のサービスでは個別の許諾申請が必要です。\n\n"
+            "● 上記以外の楽曲（海外楽曲・自主制作等）:\n"
+            "  権利者への直接確認が必要です。\n\n"
+            "本ツールの利用により生じた著作権上の問題について、\n"
+            "開発者は一切の責任を負いません。\n"
+            "利用者ご自身の責任でご使用ください。"
+        )
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("利用規約への同意")
+        dlg.geometry("520x480")
+        dlg.configure(bg=self.BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        agreed = tk.BooleanVar(value=False)
+
+        tk.Label(dlg, text="ご利用前にお読みください",
+                 font=("Helvetica", 14, "bold"),
+                 bg=self.BG, fg=self.ACCENT).pack(pady=(16, 8))
+
+        txt = tk.Text(dlg, wrap="word", bg=self.BG2, fg=self.FG,
+                      font=("Helvetica", 10), relief="flat",
+                      padx=12, pady=10, height=18)
+        txt.insert("1.0", DISCLAIMER)
+        txt.configure(state="disabled")
+        txt.pack(padx=20, fill="both", expand=True)
+
+        def _on_agree():
+            agreed.set(True)
+            try:
+                self._AGREE_FILE.write_text(
+                    f"agreed={__import__('datetime').datetime.now().isoformat()}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            dlg.destroy()
+
+        def _on_decline():
+            agreed.set(False)
+            dlg.destroy()
+
+        bf = tk.Frame(dlg, bg=self.BG)
+        bf.pack(pady=(10, 16))
+        tk.Button(bf, text="同意して利用する", command=_on_agree,
+                  bg="#0f3460", fg=self.FG, font=("Helvetica", 11, "bold"),
+                  relief="flat", padx=20, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=8)
+        tk.Button(bf, text="同意しない", command=_on_decline,
+                  bg=self.BG2, fg=self.FG2, font=("Helvetica", 10),
+                  relief="flat", padx=14, pady=6, cursor="hand2"
+                  ).pack(side="left", padx=8)
+
+        dlg.wait_window()
+        return agreed.get()
 
     # ---- UI構築 -----------------------------------------
 
@@ -4059,6 +4140,10 @@ class App:
         messagebox.showerror("エラー", f"処理に失敗しました:\n\n{msg[:600]}")
 
     def run(self):
+        try:
+            self.root.winfo_exists()
+        except tk.TclError:
+            return
         self.root.mainloop()
 
 

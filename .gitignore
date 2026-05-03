@@ -7,3 +7,7 @@ _assets/
 node_modules/
 data/
 README_LICENSES.txt
+output/
+dist/
+build/
+*.spec
