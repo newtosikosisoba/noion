@@ -2646,16 +2646,24 @@ class EarCopyEngine:
     }
 
     def _production_humanize(self, parts, drum_events, tempo, beats, seed=42):
-        """生産品質のヒューマナイズ: 拍アクセント・ランダム揺らぎ・フレーズ末尾減衰・タイミングずれ"""
+        """生産品質のヒューマナイズ:
+        - ±5 ランダムベロシティ揺らぎ (seed=曲ハッシュで再現可能)
+        - 拍頭(beat 1,3) +6、裏拍 -3 のアクセント
+        - ベロシティ標準偏差<10のパートは破棄 (死んだ採譜)
+        - フレーズ末尾 (1秒以上の無音直前3音) -8/-15/-22 減衰
+        """
         rng = np.random.RandomState(seed)
         beat_times = np.array(beats) if beats is not None and len(beats) > 0 else np.array([])
         beat_interval = 60.0 / max(tempo, 60.0) if tempo else 0.5
 
         def _is_downbeat(t):
             if len(beat_times) == 0:
-                return (t % (beat_interval * 4)) < beat_interval * 0.15
+                return (t % (beat_interval * 2)) < beat_interval * 0.15
             diffs = np.abs(beat_times - t)
-            return float(np.min(diffs)) < 0.05 if len(diffs) > 0 else False
+            if len(diffs) == 0:
+                return False
+            min_idx = int(np.argmin(diffs))
+            return float(diffs[min_idx]) < 0.05 and min_idx % 2 == 0
 
         def _is_offbeat(t):
             if len(beat_times) == 0:
@@ -2667,34 +2675,49 @@ class EarCopyEngine:
                 return offset > beat_interval * 0.35
             return False
 
+        def _find_phrase_ends(notes):
+            """1秒以上の無音区間の直前3音のインデックスを返す"""
+            ends = set()
+            sorted_notes = sorted(notes, key=lambda x: x[0])
+            for i in range(len(sorted_notes) - 1):
+                t_end = sorted_notes[i][0] + sorted_notes[i][1]
+                t_next = sorted_notes[i + 1][0]
+                if t_next - t_end >= 1.0:
+                    for j in range(max(0, i - 2), i + 1):
+                        ends.add(j)
+            for j in range(max(0, len(sorted_notes) - 3), len(sorted_notes)):
+                ends.add(j)
+            return ends
+
         new_parts = {}
         for name, notes in parts.items():
             if not notes:
-                new_parts[name] = notes
+                new_parts[name] = []
+                continue
+            vels = [v for _, _, _, v in notes]
+            if len(vels) > 1 and float(np.std(vels)) < 10:
+                new_parts[name] = []
                 continue
             jitter_s = self._TIMING_JITTER.get(name, 0.010)
+            sorted_notes = sorted(notes, key=lambda x: x[0])
+            phrase_ends = _find_phrase_ends(sorted_notes)
             humanized = []
-            n_notes = len(notes)
-            for i, (t, dur, midi, vel) in enumerate(notes):
-                # タイミングずれ
+            for i, (t, dur, midi, vel) in enumerate(sorted_notes):
                 dt = rng.uniform(-jitter_s, jitter_s)
                 new_t = max(0.0, t + dt)
-                # 拍アクセント
                 if _is_downbeat(t):
-                    vel = min(127, vel + 5)
+                    vel = min(127, vel + 6)
                 elif _is_offbeat(t):
                     vel = max(20, vel - 3)
-                # ランダムベロシティ揺らぎ
-                vel = int(np.clip(vel + rng.randint(-8, 9), 20, 127))
-                # フレーズ末尾減衰 (パート内最後3音)
-                tail_pos = n_notes - i
-                if tail_pos <= 3:
-                    decay = [0.85, 0.70, 0.55][tail_pos - 1]
-                    vel = max(20, int(vel * decay))
+                vel = int(np.clip(vel + rng.randint(-5, 6), 20, 127))
+                if i in phrase_ends:
+                    dist_from_end = max(0, max(phrase_ends) - i) if phrase_ends else 0
+                    decay_vals = [-8, -15, -22]
+                    decay_idx = min(dist_from_end, 2)
+                    vel = max(20, vel + decay_vals[decay_idx])
                 humanized.append((new_t, dur, midi, vel))
             new_parts[name] = humanized
 
-        # ドラムのヒューマナイズ
         new_drums = []
         for evt in drum_events:
             onset, kind = evt[0], evt[1]
@@ -2702,8 +2725,10 @@ class EarCopyEngine:
             dt = rng.uniform(-0.003, 0.003)
             onset = max(0.0, onset + dt)
             if _is_downbeat(evt[0]):
-                vel = min(127, vel + 5)
-            vel = int(np.clip(vel + rng.randint(-8, 9), 25, 127))
+                vel = min(127, vel + 6)
+            elif _is_offbeat(evt[0]):
+                vel = max(25, vel - 3)
+            vel = int(np.clip(vel + rng.randint(-5, 6), 25, 127))
             new_drums.append((onset, kind, vel))
 
         return new_parts, new_drums
