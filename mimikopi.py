@@ -1005,20 +1005,32 @@ class EarCopyEngine:
       - "ai_inst" : ai と同じパイプラインだがボーカルを完全に除去（カラオケ伴奏向け）
     """
 
+    # Old 15-instrument map (before consolidation):
+    # MIDI_MAP = {
+    #     'piano': (0, 0), 'e_piano': (1, 4), 'glockenspiel': (2, 9),
+    #     'organ': (3, 19), 'guitar_nylon': (4, 24), 'guitar_clean': (5, 27),
+    #     'bass': (6, 33), 'violin': (7, 40), 'viola': (8, 41),
+    #     'cello': (10, 42), 'strings': (11, 48), 'choir': (12, 52),
+    #     'trumpet': (13, 56), 'flute': (14, 73), 'pad': (15, 89),
+    # }
     MIDI_MAP = {
-        'piano': (0, 0), 'e_piano': (1, 4), 'glockenspiel': (2, 9),
-        'organ': (3, 19), 'guitar_nylon': (4, 24), 'guitar_clean': (5, 27),
-        'bass': (6, 33), 'violin': (7, 40), 'viola': (8, 41),
-        'cello': (10, 42), 'strings': (11, 48), 'choir': (12, 52),
-        'trumpet': (13, 56), 'flute': (14, 73), 'pad': (15, 89),
+        'melody': (0, 0),       # Piano
+        'chord': (1, 48),       # Strings
+        'bass': (2, 33),        # Electric Bass
+        'decoration': (3, 9),   # Glockenspiel
+        'sub_melody': (4, 42),  # Cello
     }
     GAIN = {
-        'piano': 1.0, 'e_piano': 0.85, 'glockenspiel': 0.65,
-        'organ': 0.7, 'guitar_nylon': 0.85, 'guitar_clean': 0.8,
-        'bass': 0.95, 'violin': 0.9, 'viola': 0.85, 'cello': 0.9,
-        'strings': 0.75, 'choir': 0.6, 'trumpet': 0.8,
-        'flute': 0.75, 'pad': 0.55,
+        'melody': 1.0, 'chord': 0.75, 'bass': 0.95,
+        'decoration': 0.65, 'sub_melody': 0.85,
     }
+    # 15-instrument names used internally by _ai_assign_parts / _smart_assign
+    # before _consolidate_parts reduces them to the 5 roles in MIDI_MAP.
+    _RAW_INST_NAMES = [
+        'piano', 'e_piano', 'glockenspiel', 'organ',
+        'guitar_nylon', 'guitar_clean', 'bass', 'violin', 'viola',
+        'cello', 'strings', 'choir', 'trumpet', 'flute', 'pad',
+    ]
     CHORD_IV = {
         'maj': [0,4,7], 'min': [0,3,7], 'dom7': [0,4,7,10],
         'min7': [0,3,7,10], 'maj7': [0,4,7,11], 'dim': [0,3,6],
@@ -1684,7 +1696,7 @@ class EarCopyEngine:
 
     def _smart_assign(self, cqt_notes, melody, bass, chords, beat_times):
         self._log("15パートに振り分け中...", 55)
-        parts = {name: [] for name in self.MIDI_MAP}
+        parts = {name: [] for name in self._RAW_INST_NAMES}
         mel_set = set()
         bass_set = set()
 
@@ -1988,6 +2000,7 @@ class EarCopyEngine:
         # --- ステージ4: 楽器割り当て ---
         self._log("15楽器パートに割り当て中...", 72)
         parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
+        parts = self._consolidate_parts(parts)
 
         # --- ステージ4.5: 生産品質ヒューマナイズ ---
         self._log("生産品質ヒューマナイズ中...", 73)
@@ -2321,7 +2334,7 @@ class EarCopyEngine:
 
     def _ai_assign_parts(self, vocal_notes, other_notes, bass_notes):
         """15楽器フルアレンジ: メロディ・伴奏・ベースを豊かな音色で彩る"""
-        parts = {name: [] for name in self.MIDI_MAP}
+        parts = {name: [] for name in self._RAW_INST_NAMES}
 
         # ステムごとの相対エネルギーからダブリング倍率を動的に算出
         def _stem_energy(notes, ref=0.7):
@@ -2412,6 +2425,104 @@ class EarCopyEngine:
             parts[name] = filtered
 
         return parts
+
+    # ---- パート統合 (15楽器 → 最大6パート) ----------------
+
+    def _consolidate_parts(self, parts):
+        """15楽器パートを最大6ロールに統合し、MIDI チャンネル枯渇を防ぐ。
+
+        Roles:
+            melody      – 主旋律 (piano/e_piano/flute/violin/trumpet から最多)
+            chord       – 和声   (strings/organ/pad/choir/guitar_nylon から最多)
+            bass        – ベース (そのまま)
+            decoration  – 装飾   (glockenspiel, 全体の 10 %以上のとき)
+            sub_melody  – 副旋律 (viola or cello, 全体の 10 %以上のとき)
+        """
+
+        # --- 全ノート総数 (空パートを含む) ---
+        total_notes = sum(len(v) for v in parts.values())
+        if total_notes == 0:
+            return {name: [] for name in self.MIDI_MAP}
+
+        # --- ヘルパー: パートのフィルタ判定 ---
+        def _avg_velocity(notes):
+            if not notes:
+                return 0.0
+            return float(np.mean([v for _, _, _, v in notes]))
+
+        def _vel_std(notes):
+            if not notes:
+                return 0.0
+            if len(notes) == 1:
+                return 0.0
+            return float(np.std([v for _, _, _, v in notes]))
+
+        def _should_drop(notes):
+            """ノートが少なすぎる / 弱すぎる / 無表情なパートを除外"""
+            if not notes:
+                return True
+            if _avg_velocity(notes) < 30:
+                return True
+            if len(notes) < total_notes * 0.05:
+                return True
+            if _vel_std(notes) < 10:
+                return True
+            return False
+
+        def _pick_best(candidates):
+            """候補パート名リストから最もノート数が多いパートの内容を返す。"""
+            best_name = None
+            best_count = -1
+            for name in candidates:
+                evts = parts.get(name, [])
+                if len(evts) > best_count:
+                    best_count = len(evts)
+                    best_name = name
+            if best_name is None:
+                return []
+            return list(parts[best_name])
+
+        # --- 1. melody: 主旋律 ---
+        melody_candidates = ['piano', 'e_piano', 'flute', 'violin', 'trumpet']
+        melody_notes = _pick_best(melody_candidates)
+
+        # --- 2. chord: 和声 ---
+        chord_candidates = ['strings', 'organ', 'pad', 'choir', 'guitar_nylon']
+        chord_notes = _pick_best(chord_candidates)
+
+        # --- 3. bass: そのまま ---
+        bass_notes = list(parts.get('bass', []))
+
+        # --- 4. decoration: glockenspiel (条件付き) ---
+        glock = list(parts.get('glockenspiel', []))
+        decoration_notes = glock if len(glock) > total_notes * 0.10 else []
+
+        # --- 5. sub_melody: viola or cello (条件付き、多い方) ---
+        viola = list(parts.get('viola', []))
+        cello = list(parts.get('cello', []))
+        sub_candidates = []
+        if len(viola) > total_notes * 0.10:
+            sub_candidates.append(('viola', viola))
+        if len(cello) > total_notes * 0.10:
+            sub_candidates.append(('cello', cello))
+        if sub_candidates:
+            sub_melody_notes = max(sub_candidates, key=lambda x: len(x[1]))[1]
+        else:
+            sub_melody_notes = []
+
+        # --- ドロップ判定を各ロールに適用 ---
+        consolidated = {}
+        consolidated['melody'] = [] if _should_drop(melody_notes) else melody_notes
+        consolidated['chord'] = [] if _should_drop(chord_notes) else chord_notes
+        consolidated['bass'] = [] if _should_drop(bass_notes) else bass_notes
+        consolidated['decoration'] = [] if _should_drop(decoration_notes) else decoration_notes
+        consolidated['sub_melody'] = [] if _should_drop(sub_melody_notes) else sub_melody_notes
+
+        # melody は最重要 — ドロップされた場合でも元データがあれば復活
+        if not consolidated['melody'] and melody_notes:
+            consolidated['melody'] = melody_notes
+
+        return consolidated
 
     # ---- ノート量子化・正規化 ----------------------------
 
@@ -2521,13 +2632,11 @@ class EarCopyEngine:
     # 楽器グループ別タイミングジッター (秒)
     _TIMING_JITTER = {
         'drums': 0.003,
+        'melody': 0.010,
+        'chord': 0.012,
         'bass': 0.005,
-        'piano': 0.010, 'e_piano': 0.010,
-        'guitar_nylon': 0.010, 'guitar_clean': 0.010,
-        'violin': 0.012, 'viola': 0.012, 'cello': 0.012,
-        'strings': 0.012, 'choir': 0.015,
-        'trumpet': 0.008, 'flute': 0.010,
-        'organ': 0.006, 'glockenspiel': 0.008, 'pad': 0.015,
+        'decoration': 0.008,
+        'sub_melody': 0.012,
     }
 
     def _production_humanize(self, parts, drum_events, tempo, beats, seed=42):
@@ -2654,8 +2763,13 @@ class EarCopyEngine:
             if not ascii_wav.exists() or ascii_wav.stat().st_size < 1000:
                 return None
             audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=False)
-            if audio.ndim == 2:
+            if audio.ndim == 1:
+                audio = np.column_stack([audio, audio]).astype(np.float32)
+            elif audio.ndim == 2:
                 audio = audio.T.astype(np.float32)
+            target_len = int((duration + 0.5) * SR)
+            if len(audio) > target_len:
+                audio = audio[:target_len]
             return audio
         except Exception:
             return None
@@ -2741,18 +2855,31 @@ class EarCopyEngine:
         # マルチSF2
         audio = self._synthesize_multi_sf2(midi_path, duration)
         if audio is not None:
-            return audio
+            return self._trim_to_duration(audio, duration)
 
         # 単一SF2フォールバック
         audio = self._synthesize_fluidsynth(midi_path, duration)
         if audio is not None:
-            return audio
+            return self._trim_to_duration(audio, duration)
 
         # v6 加算合成フォールバック
         self._log("  FluidSynth 未使用、v6加算合成を使用", 84)
-        n = int((duration + 2.0) * SR)
+        n = int((duration + 0.5) * SR)
         audio = self._synth_parts(parts, n) * 0.85
         audio += self._synth_drums(drum_events, n) * 0.55
+        return self._trim_to_duration(audio, duration)
+
+    def _trim_to_duration(self, audio, duration):
+        """合成音を原曲の長さ+0.3秒に切り詰める (FluidSynth のリバーブ尾を除去)"""
+        target_len = int((duration + 0.3) * SR)
+        if len(audio) > target_len:
+            fade_len = min(int(0.05 * SR), target_len)
+            audio = audio[:target_len].copy()
+            fade = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+            if audio.ndim == 2:
+                audio[-fade_len:] *= fade[:, np.newaxis]
+            else:
+                audio[-fade_len:] *= fade
         return audio
 
     # ---- パートEQ ------------------------------------------
@@ -3046,8 +3173,13 @@ class EarCopyEngine:
                 return None
 
             audio, _ = librosa.load(str(ascii_wav), sr=SR, mono=False)
-            if audio.ndim == 2:
+            if audio.ndim == 1:
+                audio = np.column_stack([audio, audio]).astype(np.float32)
+            elif audio.ndim == 2:
                 audio = audio.T.astype(np.float32)  # (2, N) → (N, 2)
+            target_len = int((duration + 0.5) * SR)
+            if len(audio) > target_len:
+                audio = audio[:target_len]
             actual_dur = len(audio) / SR
             if actual_dur < duration * 0.5:
                 self._log(f"  ⚠ FluidSynth出力が短い ({actual_dur:.1f}s / 期待{duration:.1f}s)", -1)
@@ -3622,13 +3754,21 @@ class EarCopyEngine:
         lfo = 1 + 0.1 * np.sin(2 * np.pi * 0.3 * t)
         return (s1 + s2 + s3) / 3 * lfo * self._env(t, 0.2, 0.25, 0.6, 0.35) * (vel / 127) * 0.13
 
+    # Old 15-instrument tone map (before consolidation):
+    # TONE_FN = {
+    #     'piano':'_tone_piano', 'e_piano':'_tone_e_piano',
+    #     'glockenspiel':'_tone_glockenspiel', 'organ':'_tone_organ',
+    #     'guitar_nylon':'_tone_guitar_nylon', 'guitar_clean':'_tone_guitar_clean',
+    #     'bass':'_tone_bass', 'violin':'_tone_violin', 'viola':'_tone_viola',
+    #     'cello':'_tone_cello', 'strings':'_tone_strings', 'choir':'_tone_choir',
+    #     'trumpet':'_tone_trumpet', 'flute':'_tone_flute', 'pad':'_tone_pad',
+    # }
     TONE_FN = {
-        'piano':'_tone_piano', 'e_piano':'_tone_e_piano',
-        'glockenspiel':'_tone_glockenspiel', 'organ':'_tone_organ',
-        'guitar_nylon':'_tone_guitar_nylon', 'guitar_clean':'_tone_guitar_clean',
-        'bass':'_tone_bass', 'violin':'_tone_violin', 'viola':'_tone_viola',
-        'cello':'_tone_cello', 'strings':'_tone_strings', 'choir':'_tone_choir',
-        'trumpet':'_tone_trumpet', 'flute':'_tone_flute', 'pad':'_tone_pad',
+        'melody': '_tone_piano',
+        'chord': '_tone_strings',
+        'bass': '_tone_bass',
+        'decoration': '_tone_glockenspiel',
+        'sub_melody': '_tone_cello',
     }
 
     def _synth_parts(self, parts, n):
@@ -3740,21 +3880,11 @@ class EarCopyEngine:
 
     PART_MIX = {
         #               pan(0=L,64=C,127=R)  vol  reverb  sustain
-        'piano':         (64,  105,  60,  True),
-        'e_piano':       (75,   85,  50,  False),
-        'glockenspiel':  (80,   65,  70,  False),
-        'organ':         (50,   72,  55,  False),
-        'guitar_nylon':  (40,   88,  45,  False),
-        'guitar_clean':  (90,   82,  40,  False),
+        'melody':        (64,  105,  60,  True),
+        'chord':         (64,   78,  70,  False),
         'bass':          (64,  110,  25,  False),
-        'violin':        (45,   90,  65,  False),
-        'viola':         (55,   80,  60,  False),
-        'cello':         (58,   88,  55,  False),
-        'strings':       (64,   78,  70,  False),
-        'choir':         (64,   68,  75,  False),
-        'trumpet':       (85,   75,  50,  False),
-        'flute':         (35,   80,  60,  False),
-        'pad':           (64,   60,  80,  False),
+        'decoration':    (80,   65,  70,  False),
+        'sub_melody':    (55,   85,  60,  False),
     }
 
     def _save_midi(self, parts, drums, tempo, path):
@@ -3786,7 +3916,7 @@ class EarCopyEngine:
 
             # サスティンペダル（ピアノ系のみ: 各ビートの頭で踏み替え）
             if use_sustain and len(evts) > 0:
-                max_t = max(t for t, _, _, _ in evts)
+                max_t = max(t + dur for t, dur, _, _ in evts)
                 pedal_interval = 60.0 / max(tempo, 60) * 2  # 2ビートごとに踏み替え
                 t_cur = 0.0
                 while t_cur < max_t:
@@ -3794,6 +3924,8 @@ class EarCopyEngine:
                     evs.append((tick, Message('control_change', channel=ch, control=64, value=0, time=0)))
                     evs.append((tick + 5, Message('control_change', channel=ch, control=64, value=127, time=0)))
                     t_cur += pedal_interval
+                final_tick = s2t(max_t + 0.1)
+                evs.append((final_tick, Message('control_change', channel=ch, control=64, value=0, time=0)))
 
             # ノートイベント
             for (t, dur, midi_note, vel) in evts:
