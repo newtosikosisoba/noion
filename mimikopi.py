@@ -2053,6 +2053,12 @@ class EarCopyEngine:
         self._log("出力品質チェック中...", 91)
         self._validate_output(audio, duration)
 
+        # 周波数バランスレポート
+        try:
+            self._freq_balance_report(audio, y, output_path)
+        except Exception:
+            pass
+
         # --- ステージ9: 保存 ---
         self._log("MP3を保存中...", 94)
         self._save_mp3(audio, output_path)
@@ -2826,7 +2832,7 @@ class EarCopyEngine:
 
             for gname, (audio, gcfg) in rendered_groups.items():
                 # パートEQ
-                audio = self._apply_part_eq(audio, gcfg.get("eq", {}))
+                audio = self._apply_part_eq(audio, gcfg.get("eq", {}), role=gname)
                 # ステレオワイドニング
                 width = gcfg.get("stereo_width", 1.0)
                 audio = self._stereo_widen(audio, width)
@@ -2884,41 +2890,69 @@ class EarCopyEngine:
 
     # ---- パートEQ ------------------------------------------
 
-    def _apply_part_eq(self, audio, eq_cfg):
-        """パート種別に応じた EQ を適用する"""
+    ROLE_EQ = {
+        'bass': {'hpf': 40, 'lpf': 250, 'boost_hz': 80, 'boost_db': 3},
+        'drums': {'hpf': 50, 'boost_hz': 60, 'boost_db': 4, 'lpf': 8000},
+        'melody': {'hpf': 200, 'boost_hz': 3000, 'boost_db': 2},
+        'chord': {'hpf': 150, 'cut_hz': 300, 'cut_db': -3},
+        'decoration': {'hpf': 300, 'boost_hz': 5000, 'boost_db': 1.5},
+        'sub_melody': {'hpf': 120, 'boost_hz': 2000, 'boost_db': 1},
+    }
+
+    def _apply_part_eq(self, audio, eq_cfg, role=None):
+        """パート種別に応じた EQ を適用する (role名またはeq_cfg dictから)"""
+        if role and role in self.ROLE_EQ:
+            eq_cfg = self.ROLE_EQ[role]
         if not eq_cfg:
             return audio
         nyq = SR / 2
 
-        def _shelf_filter(audio_1d, freq, gain_db, btype):
-            if abs(gain_db) < 0.5:
-                return audio_1d
-            from scipy.signal import iirpeak
-            w0 = min(freq / nyq, 0.99)
-            try:
-                b, a = iirpeak(w0, Q=0.7)
-                gain = 10 ** (gain_db / 20.0)
-                filtered = filtfilt(b, a, audio_1d).astype(np.float32)
-                return (audio_1d + (filtered - audio_1d) * (gain - 1.0)).astype(np.float32)
-            except Exception:
-                return audio_1d
-
         def _process_1d(sig):
-            low_db = eq_cfg.get("low_shelf_db", 0)
-            high_db = eq_cfg.get("high_shelf_db", 0)
-            mid_db = eq_cfg.get("mid_db", 0)
-            mid_freq = eq_cfg.get("mid_freq_hz", 2500)
-
-            if low_db != 0:
-                sig = _shelf_filter(sig, 200, low_db, "low")
-            if high_db != 0:
-                sig = _shelf_filter(sig, 8000, high_db, "high")
-            if mid_db != 0:
+            if 'hpf' in eq_cfg:
+                freq = eq_cfg['hpf']
+                b, a = butter(2, min(freq / nyq, 0.99), btype='high')
+                sig = filtfilt(b, a, sig).astype(np.float32)
+            if 'lpf' in eq_cfg:
+                freq = eq_cfg['lpf']
+                b, a = butter(2, min(freq / nyq, 0.99), btype='low')
+                sig = filtfilt(b, a, sig).astype(np.float32)
+            if 'boost_hz' in eq_cfg and 'boost_db' in eq_cfg:
+                from scipy.signal import iirpeak
+                freq = eq_cfg['boost_hz']
+                gain_db = eq_cfg['boost_db']
+                w0 = min(freq / nyq, 0.99)
                 try:
-                    from scipy.signal import iirpeak
-                    w0 = min(mid_freq / nyq, 0.99)
-                    b, a = iirpeak(w0, Q=1.5)
-                    gain = 10 ** (mid_db / 20.0)
+                    b, a = iirpeak(w0, Q=1.0)
+                    gain = 10 ** (gain_db / 20.0)
+                    filtered = filtfilt(b, a, sig).astype(np.float32)
+                    sig = (sig + (filtered - sig) * (gain - 1.0)).astype(np.float32)
+                except Exception:
+                    pass
+            if 'cut_hz' in eq_cfg and 'cut_db' in eq_cfg:
+                from scipy.signal import iirpeak
+                freq = eq_cfg['cut_hz']
+                gain_db = eq_cfg['cut_db']
+                w0 = min(freq / nyq, 0.99)
+                try:
+                    b, a = iirpeak(w0, Q=0.8)
+                    gain = 10 ** (gain_db / 20.0)
+                    filtered = filtfilt(b, a, sig).astype(np.float32)
+                    sig = (sig + (filtered - sig) * (gain - 1.0)).astype(np.float32)
+                except Exception:
+                    pass
+            # instruments.json legacy support
+            for key in ('low_shelf_db', 'high_shelf_db', 'mid_db'):
+                val = eq_cfg.get(key, 0)
+                if abs(val) < 0.5:
+                    continue
+                from scipy.signal import iirpeak
+                freq_map = {'low_shelf_db': 200, 'high_shelf_db': 8000,
+                            'mid_db': eq_cfg.get('mid_freq_hz', 2500)}
+                freq = freq_map[key]
+                w0 = min(freq / nyq, 0.99)
+                try:
+                    b, a = iirpeak(w0, Q=0.7 if 'shelf' in key else 1.5)
+                    gain = 10 ** (val / 20.0)
                     filtered = filtfilt(b, a, sig).astype(np.float32)
                     sig = (sig + (filtered - sig) * (gain - 1.0)).astype(np.float32)
                 except Exception:
@@ -3364,6 +3398,22 @@ class EarCopyEngine:
         else:
             audio = filtfilt(b, a, audio).astype(np.float32)
 
+        # マスターエア感: +2dB @ 10kHz
+        try:
+            from scipy.signal import iirpeak
+            w0 = min(10000 / nyq, 0.99)
+            b_air, a_air = iirpeak(w0, Q=0.7)
+            gain_air = 10 ** (2.0 / 20.0)
+            if is_stereo:
+                for ch in range(audio.shape[1]):
+                    filt = filtfilt(b_air, a_air, audio[:, ch]).astype(np.float32)
+                    audio[:, ch] = (audio[:, ch] + (filt - audio[:, ch]) * (gain_air - 1.0)).astype(np.float32)
+            else:
+                filt = filtfilt(b_air, a_air, audio).astype(np.float32)
+                audio = (audio + (filt - audio) * (gain_air - 1.0)).astype(np.float32)
+        except Exception:
+            pass
+
         # パートごとゲイン: 合計時にピーク<1.0 を目標
         peak = np.max(np.abs(audio))
         if peak > 0.8:
@@ -3432,6 +3482,49 @@ class EarCopyEngine:
         else:
             self._log(f"✓ 出力品質チェック OK ({fmt}, 長さ・音量・スペクトル正常)", 92)
         return len(issues) == 0
+
+    def _freq_balance_report(self, output_audio, input_audio, output_path):
+        """出力と原曲の周波数バランスを比較し、JSONレポートを生成"""
+        import json as _json
+        bands = [
+            ("sub", 0, 80),
+            ("bass", 80, 250),
+            ("low_mid", 250, 1000),
+            ("mid", 1000, 4000),
+            ("high_mid", 4000, 8000),
+            ("high", 8000, 16000),
+        ]
+        def _band_energy(audio_1d):
+            n = min(len(audio_1d), SR * 10)
+            fft = np.abs(np.fft.rfft(audio_1d[:n]))
+            freqs = np.fft.rfftfreq(n, 1 / SR)
+            total = float(np.sum(fft ** 2)) + 1e-12
+            result = {}
+            for name, lo, hi in bands:
+                mask = (freqs >= lo) & (freqs < hi)
+                energy = float(np.sum(fft[mask] ** 2))
+                result[name] = round(energy / total * 100, 2)
+            return result
+
+        out_mono = output_audio.mean(axis=1) if output_audio.ndim == 2 else output_audio
+        in_mono = input_audio if input_audio.ndim == 1 else input_audio.mean(axis=1)
+        report = {
+            "output": _band_energy(out_mono),
+            "input": _band_energy(in_mono),
+            "ratio": {},
+        }
+        for name, _, _ in bands:
+            inp = max(report["input"][name], 0.01)
+            report["ratio"][name] = round(report["output"][name] / inp, 2)
+        report_path = str(Path(output_path).with_suffix(".freq_report.json"))
+        try:
+            Path(report_path).write_text(
+                _json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            self._log(f"  周波数バランスレポート: {report_path}", 93)
+        except Exception:
+            pass
+        return report
 
     # ---- 音声読み込み ------------------------------------
 
