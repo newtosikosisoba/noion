@@ -3933,6 +3933,16 @@ class EarCopyEngine:
         us = int(60_000_000 / tempo)
         def s2t(s): return int(s * tempo / 60 * tpb)
 
+        used_channels = set()
+        for name in parts:
+            if name in self.MIDI_MAP:
+                ch, _ = self.MIDI_MAP[name]
+                if ch == 9:
+                    self._log(f"  ⚠ MIDI_MAP '{name}' がドラム専用ch9を使用", -1)
+                used_channels.add(ch)
+        active_parts = sum(1 for v in parts.values() if v)
+        self._log(f"  MIDI出力: {active_parts}パート, ch={sorted(used_channels)}", 76)
+
         # テンポトラック
         tt = MidiTrack()
         tt.append(MetaMessage('set_tempo', tempo=us, time=0))
