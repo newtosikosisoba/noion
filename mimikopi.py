@@ -3289,6 +3289,42 @@ class EarCopyEngine:
         lufs = -0.691 + 10 * np.log10(max(mean_power, 1e-12))
         return float(lufs)
 
+    def _soft_limit(self, audio, threshold_db=-1.0, lookahead_ms=5.0):
+        """Lookahead付きソフトリミッター: ピークを threshold_db 以下に抑える"""
+        threshold = 10 ** (threshold_db / 20.0)
+        lookahead = int(lookahead_ms * SR / 1000)
+
+        if audio.ndim == 2:
+            peak_env = np.max(np.abs(audio), axis=1)
+        else:
+            peak_env = np.abs(audio)
+
+        gain = np.ones(len(peak_env), dtype=np.float32)
+        for i in range(len(peak_env)):
+            if peak_env[i] > threshold:
+                gain[i] = threshold / peak_env[i]
+
+        if lookahead > 0:
+            smoothed = np.copy(gain)
+            for i in range(len(gain) - 1, -1, -1):
+                end = min(i + lookahead, len(gain))
+                smoothed[i] = np.min(gain[i:end])
+            attack_coeff = np.exp(-1 / max(lookahead, 1))
+            env = 1.0
+            for i in range(len(smoothed)):
+                if smoothed[i] < env:
+                    env = smoothed[i]
+                else:
+                    env = attack_coeff * env + (1 - attack_coeff) * smoothed[i]
+                smoothed[i] = env
+            gain = smoothed
+
+        if audio.ndim == 2:
+            audio = audio * gain[:, np.newaxis]
+        else:
+            audio = audio * gain
+        return audio.astype(np.float32)
+
     def _lufs_normalize(self, audio, target_lufs=-14.0):
         """LUFS ベースのラウドネス正規化 (YouTube 基準 -14 LUFS)"""
         current_lufs = self._measure_lufs(audio)
@@ -3297,12 +3333,7 @@ class EarCopyEngine:
         diff_db = max(-20.0, min(20.0, diff_db))
         gain = 10 ** (diff_db / 20.0)
         audio = audio * gain
-        # ソフトクリップで True Peak 防止
-        audio = np.where(
-            np.abs(audio) > 0.95,
-            np.sign(audio) * (0.95 + np.tanh((np.abs(audio) - 0.95) * 4) * 0.03),
-            audio
-        ).astype(np.float32)
+        audio = np.clip(audio, -0.999, 0.999).astype(np.float32)
         return audio
 
     def _master(self, audio):
@@ -3333,23 +3364,30 @@ class EarCopyEngine:
         else:
             audio = filtfilt(b, a, audio).astype(np.float32)
 
+        # パートごとゲイン: 合計時にピーク<1.0 を目標
+        peak = np.max(np.abs(audio))
+        if peak > 0.8:
+            audio = (audio * (0.8 / peak)).astype(np.float32)
+
         # ソフトコンプレッション (閾値 -18dB, ratio 3:1)
         audio = self._soft_compress(audio, threshold_db=-18.0, ratio=3.0)
 
-        # ソフトニーリミッター
-        peak = np.max(np.abs(audio))
-        if peak > 0:
-            audio = audio / peak * 0.96
-        audio = np.where(
-            np.abs(audio) > 0.93,
-            np.sign(audio) * (0.93 + np.tanh((np.abs(audio) - 0.93) * 4) * 0.04),
-            audio
-        ).astype(np.float32)
+        # ソフトリミッター (-1dB threshold, lookahead 5ms)
+        audio = self._soft_limit(audio, threshold_db=-1.0, lookahead_ms=5.0)
 
         # -14 LUFS ラウドネス正規化 (YouTube 基準)
         audio = self._lufs_normalize(audio, target_lufs=-14.0)
 
-        return audio.astype(np.float32)
+        # ピークノーマライズ (-0.3 dBFS = 0.966)
+        peak = np.max(np.abs(audio))
+        if peak > 0:
+            target_peak = 10 ** (-0.3 / 20.0)  # 0.966
+            audio = (audio * (target_peak / peak)).astype(np.float32)
+
+        # 安全網: ハードクリップ
+        audio = np.clip(audio, -0.999, 0.999).astype(np.float32)
+
+        return audio
 
     def _validate_output(self, audio, duration):
         """出力音声の品質チェック。モノ/ステレオ両対応。"""
@@ -3867,6 +3905,7 @@ class EarCopyEngine:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp = f.name
         try:
+            audio = np.clip(audio, -0.999, 0.999).astype(np.float32)
             sf.write(tmp, audio, SR)
             seg = AudioSegment.from_wav(tmp)
             seg.export(path, format="mp3", bitrate="320k")
