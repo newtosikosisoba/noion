@@ -2770,7 +2770,7 @@ class EarCopyEngine:
                 new_parts[name] = []
                 continue
             vels = [v for _, _, _, v in notes]
-            if len(vels) > 1 and float(np.std(vels)) < 10:
+            if name != 'pad' and len(vels) > 1 and float(np.std(vels)) < 10:
                 new_parts[name] = []
                 continue
             jitter_s = self._TIMING_JITTER.get(name, 0.010)
