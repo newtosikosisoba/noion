@@ -1014,15 +1014,16 @@ class EarCopyEngine:
     #     'trumpet': (13, 56), 'flute': (14, 73), 'pad': (15, 89),
     # }
     MIDI_MAP = {
-        'melody': (0, 0),       # Piano
-        'chord': (1, 48),       # Strings
+        'melody': (0, 0),       # Acoustic Grand Piano
+        'chord': (1, 4),        # Electric Piano
         'bass': (2, 33),        # Electric Bass
-        'decoration': (3, 9),   # Glockenspiel
-        'sub_melody': (4, 42),  # Cello
+        'pad': (3, 89),         # Pad (Warm)
+        'decoration': (4, 9),   # Glockenspiel
+        'sub_melody': (5, 42),  # Cello
     }
     GAIN = {
-        'melody': 1.0, 'chord': 0.75, 'bass': 0.95,
-        'decoration': 0.65, 'sub_melody': 0.85,
+        'melody': 1.0, 'chord': 0.80, 'bass': 0.95,
+        'pad': 0.45, 'decoration': 0.65, 'sub_melody': 0.85,
     }
     # 15-instrument names used internally by _ai_assign_parts / _smart_assign
     # before _consolidate_parts reduces them to the 5 roles in MIDI_MAP.
@@ -2435,94 +2436,120 @@ class EarCopyEngine:
     # ---- パート統合 (15楽器 → 最大6パート) ----------------
 
     def _consolidate_parts(self, parts):
-        """15楽器パートを最大6ロールに統合し、MIDI チャンネル枯渇を防ぐ。
+        """15楽器パートを音域・同時発音で melody/chord/bass/pad/decoration に分離。
 
-        Roles:
-            melody      – 主旋律 (piano/e_piano/flute/violin/trumpet から最多)
-            chord       – 和声   (strings/organ/pad/choir/guitar_nylon から最多)
-            bass        – ベース (そのまま)
-            decoration  – 装飾   (glockenspiel, 全体の 10 %以上のとき)
-            sub_melody  – 副旋律 (viola or cello, 全体の 10 %以上のとき)
+        全ノートをプールし、音楽的役割で再分配する:
+          bass:       MIDI 36-55 (E2-G3)
+          chord:      同時3音以上クラスタ (MIDI 48-72)
+          melody:     最高音・単音 (MIDI 60-96)
+          pad:        コード進行から自動生成される持続音 (後段で追加)
+          decoration: 高音域装飾音 (MIDI 84+)
+          sub_melody: 残りの中音域
         """
-
-        # --- 全ノート総数 (空パートを含む) ---
-        total_notes = sum(len(v) for v in parts.values())
-        if total_notes == 0:
+        all_notes = []
+        for name, evts in parts.items():
+            all_notes.extend(evts)
+        if not all_notes:
             return {name: [] for name in self.MIDI_MAP}
 
-        # --- ヘルパー: パートのフィルタ判定 ---
-        def _avg_velocity(notes):
-            if not notes:
-                return 0.0
-            return float(np.mean([v for _, _, _, v in notes]))
+        all_notes.sort(key=lambda x: x[0])
 
-        def _vel_std(notes):
-            if not notes:
-                return 0.0
-            if len(notes) == 1:
-                return 0.0
-            return float(np.std([v for _, _, _, v in notes]))
+        # --- 同時発音クラスタ検出 (±50ms) ---
+        clusters = []
+        current_cluster = [all_notes[0]]
+        for note in all_notes[1:]:
+            if abs(note[0] - current_cluster[0][0]) <= 0.05:
+                current_cluster.append(note)
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [note]
+        clusters.append(current_cluster)
 
-        def _should_drop(notes):
-            """ノートが少なすぎる / 弱すぎる / 無表情なパートを除外"""
-            if not notes:
-                return True
-            if _avg_velocity(notes) < 30:
-                return True
-            if len(notes) < total_notes * 0.05:
-                return True
-            if _vel_std(notes) < 10:
-                return True
-            return False
+        bass_notes = []
+        chord_notes = []
+        melody_notes = []
+        decoration_notes = []
+        assigned = set()
 
-        def _pick_best(candidates):
-            """候補パート名リストから最もノート数が多いパートの内容を返す。"""
-            best_name = None
-            best_count = -1
-            for name in candidates:
-                evts = parts.get(name, [])
-                if len(evts) > best_count:
-                    best_count = len(evts)
-                    best_name = name
-            if best_name is None:
+        for cluster in clusters:
+            if len(cluster) >= 3:
+                mid_range = [n for n in cluster if 48 <= n[2] <= 72]
+                if len(mid_range) >= 3:
+                    for n in mid_range:
+                        chord_notes.append(n)
+                        assigned.add(id(n))
+                    for n in cluster:
+                        if id(n) not in assigned:
+                            if n[2] > 72:
+                                melody_notes.append(n)
+                                assigned.add(id(n))
+                    continue
+
+            for n in cluster:
+                if id(n) in assigned:
+                    continue
+                if n[2] <= 55:
+                    bass_notes.append(n)
+                    assigned.add(id(n))
+
+        for cluster in clusters:
+            unassigned = [n for n in cluster if id(n) not in assigned]
+            if not unassigned:
+                continue
+            if len(unassigned) == 1:
+                n = unassigned[0]
+                if 60 <= n[2] <= 96:
+                    melody_notes.append(n)
+                elif n[2] > 96:
+                    decoration_notes.append(n)
+                elif n[2] >= 48:
+                    chord_notes.append(n)
+                else:
+                    bass_notes.append(n)
+                assigned.add(id(n))
+            else:
+                highest = max(unassigned, key=lambda x: x[2])
+                if highest[2] >= 60:
+                    melody_notes.append(highest)
+                    assigned.add(id(highest))
+                for n in unassigned:
+                    if id(n) not in assigned:
+                        if n[2] >= 84:
+                            decoration_notes.append(n)
+                        elif 48 <= n[2] <= 72:
+                            chord_notes.append(n)
+                        elif n[2] < 48:
+                            bass_notes.append(n)
+                        else:
+                            melody_notes.append(n)
+                        assigned.add(id(n))
+
+        for n in all_notes:
+            if id(n) not in assigned:
+                if n[2] <= 55:
+                    bass_notes.append(n)
+                elif n[2] >= 84:
+                    decoration_notes.append(n)
+                elif n[2] >= 60:
+                    melody_notes.append(n)
+                else:
+                    chord_notes.append(n)
+
+        def _drop_weak(notes, min_count=3):
+            if len(notes) < min_count:
                 return []
-            return list(parts[best_name])
+            vels = [v for _, _, _, v in notes]
+            if np.mean(vels) < 25:
+                return []
+            return notes
 
-        # --- 1. melody: 主旋律 ---
-        melody_candidates = ['piano', 'e_piano', 'flute', 'violin', 'trumpet']
-        melody_notes = _pick_best(melody_candidates)
-
-        # --- 2. chord: 和声 ---
-        chord_candidates = ['strings', 'organ', 'pad', 'choir', 'guitar_nylon']
-        chord_notes = _pick_best(chord_candidates)
-
-        # --- 3. bass: そのまま ---
-        bass_notes = list(parts.get('bass', []))
-
-        # --- 4. decoration: glockenspiel (条件付き) ---
-        glock = list(parts.get('glockenspiel', []))
-        decoration_notes = glock if len(glock) > total_notes * 0.10 else []
-
-        # --- 5. sub_melody: viola or cello (条件付き、多い方) ---
-        viola = list(parts.get('viola', []))
-        cello = list(parts.get('cello', []))
-        sub_candidates = []
-        if len(viola) > total_notes * 0.10:
-            sub_candidates.append(('viola', viola))
-        if len(cello) > total_notes * 0.10:
-            sub_candidates.append(('cello', cello))
-        if sub_candidates:
-            sub_melody_notes = max(sub_candidates, key=lambda x: len(x[1]))[1]
-        else:
-            sub_melody_notes = []
-
-        # --- ドロップ判定を各ロールに適用 ---
-        consolidated = {}
-        consolidated['melody'] = [] if _should_drop(melody_notes) else melody_notes
-        consolidated['chord'] = [] if _should_drop(chord_notes) else chord_notes
-        consolidated['bass'] = [] if _should_drop(bass_notes) else bass_notes
-        consolidated['decoration'] = [] if _should_drop(decoration_notes) else decoration_notes
-        consolidated['sub_melody'] = [] if _should_drop(sub_melody_notes) else sub_melody_notes
+        consolidated = {
+            'melody': _drop_weak(melody_notes),
+            'chord': _drop_weak(chord_notes),
+            'bass': _drop_weak(bass_notes),
+            'decoration': _drop_weak(decoration_notes, min_count=5),
+            'sub_melody': [],
+        }
 
         # melody は最重要 — ドロップされた場合でも元データがあれば復活
         if not consolidated['melody'] and melody_notes:
@@ -2641,6 +2668,7 @@ class EarCopyEngine:
         'melody': 0.010,
         'chord': 0.012,
         'bass': 0.005,
+        'pad': 0.015,
         'decoration': 0.008,
         'sub_melody': 0.012,
     }
@@ -3959,6 +3987,7 @@ class EarCopyEngine:
         'melody': '_tone_piano',
         'chord': '_tone_strings',
         'bass': '_tone_bass',
+        'pad': '_tone_strings',
         'decoration': '_tone_glockenspiel',
         'sub_melody': '_tone_cello',
     }
@@ -4073,11 +4102,12 @@ class EarCopyEngine:
 
     PART_MIX = {
         #               pan(0=L,64=C,127=R)  vol  reverb  sustain
-        'melody':        (64,  105,  60,  True),
-        'chord':         (64,   78,  70,  False),
-        'bass':          (64,  110,  25,  False),
-        'decoration':    (80,   65,  70,  False),
-        'sub_melody':    (55,   85,  60,  False),
+        'melody':        (64,  105,  55,  True),
+        'chord':         (75,   85,  65,  False),
+        'bass':          (64,  110,  20,  False),
+        'pad':           (64,   55,  80,  False),
+        'decoration':    (85,   60,  70,  False),
+        'sub_melody':    (50,   80,  60,  False),
     }
 
     def _save_midi(self, parts, drums, tempo, path):
