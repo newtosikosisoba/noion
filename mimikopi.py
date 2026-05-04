@@ -1999,9 +1999,12 @@ class EarCopyEngine:
         self._log_midi_stats("最終ベース", bass_notes)
 
         # --- ステージ4: 楽器割り当て ---
-        self._log("15楽器パートに割り当て中...", 72)
+        self._log("パート分離・楽器割り当て中...", 72)
         parts = self._ai_assign_parts(vocal_notes, other_notes, bass_notes)
         parts = self._consolidate_parts(parts)
+        parts = self._generate_pad_from_chords(parts, tempo, duration)
+        active = {k: len(v) for k, v in parts.items() if v}
+        self._log(f"  パート構成: {active}", 73)
 
         # --- ステージ4.5: 生産品質ヒューマナイズ ---
         self._log("生産品質ヒューマナイズ中...", 73)
@@ -2556,6 +2559,50 @@ class EarCopyEngine:
             consolidated['melody'] = melody_notes
 
         return consolidated
+
+    def _generate_pad_from_chords(self, parts, tempo, duration):
+        """chord パートからルート音を抽出し、持続音パッドを自動生成する。
+
+        各小節の先頭コードからルート+5度+オクターブ上を全音符で生成。
+        ボリュームは他パートの -12dB (= 0.25倍) に設定。
+        """
+        chord_notes = parts.get('chord', [])
+        if not chord_notes:
+            return parts
+
+        config = _load_instrument_config()
+        if config and not config.get("pad_layer", True):
+            return parts
+
+        beat_dur = 60.0 / max(tempo, 60)
+        bar_dur = beat_dur * 4
+        n_bars = int(duration / bar_dur) + 1
+
+        chord_sorted = sorted(chord_notes, key=lambda x: x[0])
+        pad_notes = []
+
+        for bar_idx in range(n_bars):
+            bar_start = bar_idx * bar_dur
+            bar_end = bar_start + bar_dur
+            bar_chords = [n for n in chord_sorted
+                          if bar_start - 0.1 <= n[0] < bar_end]
+            if not bar_chords:
+                continue
+            root_midi = min(n[2] for n in bar_chords)
+            avg_vel = int(np.mean([n[3] for n in bar_chords]) * 0.25)
+            avg_vel = max(20, min(70, avg_vel))
+
+            pad_dur = min(bar_dur, duration - bar_start)
+            if pad_dur < 0.5:
+                continue
+
+            root = max(48, min(60, root_midi))
+            pad_notes.append((bar_start, pad_dur, root, avg_vel))
+            pad_notes.append((bar_start, pad_dur, root + 7, avg_vel))
+            pad_notes.append((bar_start, pad_dur, root + 12, int(avg_vel * 0.8)))
+
+        parts['pad'] = pad_notes
+        return parts
 
     # ---- ノート量子化・正規化 ----------------------------
 
