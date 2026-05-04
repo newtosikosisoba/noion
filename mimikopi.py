@@ -2991,10 +2991,11 @@ class EarCopyEngine:
     # ---- パートEQ ------------------------------------------
 
     ROLE_EQ = {
-        'bass': {'hpf': 40, 'lpf': 250, 'boost_hz': 80, 'boost_db': 3},
+        'bass': {'hpf': 35, 'lpf': 200, 'boost_hz': 80, 'boost_db': 4},
         'drums': {'hpf': 50, 'boost_hz': 60, 'boost_db': 4, 'lpf': 8000},
-        'melody': {'hpf': 200, 'boost_hz': 3000, 'boost_db': 2},
-        'chord': {'hpf': 150, 'cut_hz': 300, 'cut_db': -3},
+        'melody': {'hpf': 250, 'boost_hz': 3000, 'boost_db': 2, 'boost2_hz': 8000, 'boost2_db': 1},
+        'chord': {'hpf': 180, 'cut_hz': 400, 'cut_db': -3, 'boost_hz': 5000, 'boost_db': 1},
+        'pad': {'hpf': 200, 'cut_hz': 1000, 'cut_db': -6, 'boost_hz': 12000, 'boost_db': 2},
         'decoration': {'hpf': 300, 'boost_hz': 5000, 'boost_db': 1.5},
         'sub_melody': {'hpf': 120, 'boost_hz': 2000, 'boost_db': 1},
     }
@@ -3020,6 +3021,18 @@ class EarCopyEngine:
                 from scipy.signal import iirpeak
                 freq = eq_cfg['boost_hz']
                 gain_db = eq_cfg['boost_db']
+                w0 = min(freq / nyq, 0.99)
+                try:
+                    b, a = iirpeak(w0, Q=1.0)
+                    gain = 10 ** (gain_db / 20.0)
+                    filtered = filtfilt(b, a, sig).astype(np.float32)
+                    sig = (sig + (filtered - sig) * (gain - 1.0)).astype(np.float32)
+                except Exception:
+                    pass
+            if 'boost2_hz' in eq_cfg and 'boost2_db' in eq_cfg:
+                from scipy.signal import iirpeak
+                freq = eq_cfg['boost2_hz']
+                gain_db = eq_cfg['boost2_db']
                 w0 = min(freq / nyq, 0.99)
                 try:
                     b, a = iirpeak(w0, Q=1.0)
@@ -3537,12 +3550,27 @@ class EarCopyEngine:
         else:
             audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # マスターエア感: +2dB @ 10kHz
+        # マスター低域ブースト: +1.5dB @ 100Hz (ベース帯不足解消)
         try:
             from scipy.signal import iirpeak
-            w0 = min(10000 / nyq, 0.99)
-            b_air, a_air = iirpeak(w0, Q=0.7)
-            gain_air = 10 ** (2.0 / 20.0)
+            w0_lo = min(100 / nyq, 0.99)
+            b_lo, a_lo = iirpeak(w0_lo, Q=0.7)
+            gain_lo = 10 ** (1.5 / 20.0)
+            if is_stereo:
+                for ch in range(audio.shape[1]):
+                    filt = filtfilt(b_lo, a_lo, audio[:, ch]).astype(np.float32)
+                    audio[:, ch] = (audio[:, ch] + (filt - audio[:, ch]) * (gain_lo - 1.0)).astype(np.float32)
+            else:
+                filt = filtfilt(b_lo, a_lo, audio).astype(np.float32)
+                audio = (audio + (filt - audio) * (gain_lo - 1.0)).astype(np.float32)
+        except Exception:
+            pass
+
+        # マスターエア感: +1dB @ 12kHz
+        try:
+            w0_air = min(12000 / nyq, 0.99)
+            b_air, a_air = iirpeak(w0_air, Q=0.7)
+            gain_air = 10 ** (1.0 / 20.0)
             if is_stereo:
                 for ch in range(audio.shape[1]):
                     filt = filtfilt(b_air, a_air, audio[:, ch]).astype(np.float32)
