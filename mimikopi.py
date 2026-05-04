@@ -3384,6 +3384,45 @@ class EarCopyEngine:
             audio = audio * gain
         return audio.astype(np.float32)
 
+    def _true_peak_limit(self, audio, ceiling_dbtp=-1.0):
+        """True Peak リミッター: 4倍オーバーサンプリングでISPを検出・抑制"""
+        ceiling = 10 ** (ceiling_dbtp / 20.0)
+        from scipy.signal import resample_poly
+
+        def _limit_1d(sig):
+            up = resample_poly(sig, 4, 1).astype(np.float32)
+            peak_up = np.max(np.abs(up))
+            if peak_up <= ceiling:
+                return sig
+            block = 4 * 16
+            attack_samples = max(1, int(0.0001 * SR * 4))
+            release_coeff = np.exp(-1.0 / (0.05 * SR * 4))
+            gain_curve = np.ones(len(up), dtype=np.float32)
+            for i in range(0, len(up) - block, block):
+                chunk_peak = np.max(np.abs(up[i:i + block]))
+                if chunk_peak > ceiling:
+                    g = ceiling / chunk_peak
+                    start = max(0, i - attack_samples)
+                    gain_curve[start:i + block] = np.minimum(
+                        gain_curve[start:i + block], g
+                    )
+            env = 1.0
+            for i in range(len(gain_curve)):
+                if gain_curve[i] < env:
+                    env = gain_curve[i]
+                else:
+                    env = release_coeff * env + (1 - release_coeff) * gain_curve[i]
+                gain_curve[i] = env
+            up *= gain_curve
+            return resample_poly(up, 1, 4).astype(np.float32)[:len(sig)]
+
+        if audio.ndim == 2:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _limit_1d(audio[:, ch])
+        else:
+            audio = _limit_1d(audio)
+        return audio.astype(np.float32)
+
     def _lufs_normalize(self, audio, target_lufs=-14.0):
         """LUFS ベースのラウドネス正規化 (YouTube 基準 -14 LUFS)"""
         current_lufs = self._measure_lufs(audio)
@@ -3453,14 +3492,11 @@ class EarCopyEngine:
         # -14 LUFS ラウドネス正規化 (YouTube 基準)
         audio = self._lufs_normalize(audio, target_lufs=-14.0)
 
-        # ピークノーマライズ (-0.3 dBFS = 0.966)
-        peak = np.max(np.abs(audio))
-        if peak > 0:
-            target_peak = 10 ** (-0.3 / 20.0)  # 0.966
-            audio = (audio * (target_peak / peak)).astype(np.float32)
+        # True Peak リミッター (-1 dBTP、MP3エンコード後のISP防止)
+        audio = self._true_peak_limit(audio, ceiling_dbtp=-1.0)
 
         # 安全網: ハードクリップ
-        audio = np.clip(audio, -0.999, 0.999).astype(np.float32)
+        audio = np.clip(audio, -0.891, 0.891).astype(np.float32)
 
         return audio
 
