@@ -2967,6 +2967,9 @@ class EarCopyEngine:
                 mix = np.zeros(target_len, dtype=np.float32)
 
             for gname, (audio, gcfg) in rendered_groups.items():
+                # ドラムのトランジェント強調
+                if gname == "drums":
+                    audio = self._transient_shape(audio)
                 # パートEQ
                 audio = self._apply_part_eq(audio, gcfg.get("eq", {}), role=gname)
                 # ステレオワイドニング
@@ -2991,6 +2994,48 @@ class EarCopyEngine:
             return mix.astype(np.float32)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _transient_shape(self, audio, attack_gain_db=6.0, attack_ms=15.0, release_ms=30.0):
+        """ドラムのアタックを強調するトランジェントシェイパー。"""
+        attack_samples = int(attack_ms / 1000.0 * SR)
+        release_samples = int(release_ms / 1000.0 * SR)
+        gain_lin = 10 ** (attack_gain_db / 20.0)
+
+        def _process_1d(sig):
+            out = sig.copy()
+            n = len(sig)
+            env = np.zeros(n, dtype=np.float32)
+            env[0] = abs(sig[0])
+            alpha = 0.995
+            for i in range(1, n):
+                env[i] = max(abs(sig[i]), env[i - 1] * alpha)
+            gain_env = np.ones(n, dtype=np.float32)
+            i = 0
+            while i < n - 1:
+                diff = abs(sig[i]) - (env[i - 1] if i > 0 else 0)
+                if diff > env[i] * 0.3 and abs(sig[i]) > 0.01:
+                    end_attack = min(i + attack_samples, n)
+                    end_release = min(end_attack + release_samples, n)
+                    for j in range(i, end_attack):
+                        gain_env[j] = gain_lin
+                    if end_release > end_attack:
+                        release_ramp = np.linspace(gain_lin, 1.0, end_release - end_attack)
+                        gain_env[end_attack:end_release] = release_ramp
+                    i = end_release
+                else:
+                    i += 1
+            out = sig * gain_env
+            peak = np.max(np.abs(out))
+            if peak > 0.95:
+                out *= 0.95 / peak
+            return out.astype(np.float32)
+
+        if audio.ndim == 2:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _process_1d(audio[:, ch])
+        else:
+            audio = _process_1d(audio)
+        return audio
 
     def _synthesize_audio(self, midi_path, parts, drum_events, duration):
         """マルチSF2合成を試み、失敗時は単一SF2、最終フォールバックは v6 加算合成"""
