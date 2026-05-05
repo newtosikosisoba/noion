@@ -130,6 +130,7 @@ def _build_output_cached(tmp_dir):
 
     tempo = 120.0
     beats = np.arange(0, DURATION, 60.0 / tempo)
+    parts = engine._enforce_velocity_floor(parts, seed=42)
     parts, drum_events = engine._production_humanize(parts, drum_events, tempo, beats)
 
     midi_path = str(Path(tmp_dir) / "test.mid")

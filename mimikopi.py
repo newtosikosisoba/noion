@@ -2006,7 +2006,8 @@ class EarCopyEngine:
         active = {k: len(v) for k, v in parts.items() if v}
         self._log(f"  パート構成: {active}", 73)
 
-        # --- ステージ4.5: 生産品質ヒューマナイズ ---
+        # --- ステージ4.5: ベロシティ底上げ + 生産品質ヒューマナイズ ---
+        parts = self._enforce_velocity_floor(parts, seed=42)
         self._log("生産品質ヒューマナイズ中...", 73)
         parts, drum_events = self._production_humanize(
             parts, drum_events, tempo, beats, seed=42
@@ -2720,6 +2721,41 @@ class EarCopyEngine:
         'sub_melody': 0.012,
     }
 
+    _VELOCITY_FLOOR = {
+        'melody':     (70, 110),
+        'chord':      (60,  95),
+        'bass':       (80, 120),
+        'pad':        (50,  80),
+        'decoration': (55,  85),
+        'sub_melody': (55,  90),
+    }
+
+    def _enforce_velocity_floor(self, parts, seed=42):
+        """パートごとに velocity を線形リスケールし、FluidSynth の暗い音色レイヤーを回避する。"""
+        rng = np.random.RandomState(seed)
+        new_parts = {}
+        for name, notes in parts.items():
+            if not notes:
+                new_parts[name] = notes
+                continue
+            bounds = self._VELOCITY_FLOOR.get(name)
+            if bounds is None:
+                new_parts[name] = notes
+                continue
+            new_min, new_max = bounds
+            vels = [n[3] for n in notes]
+            old_min, old_max = min(vels), max(vels)
+            old_range = max(old_max - old_min, 1)
+            rescaled = []
+            for (t, dur, midi, vel) in notes:
+                nv = new_min + (vel - old_min) / old_range * (new_max - new_min)
+                if name == 'pad':
+                    nv += rng.randint(-8, 9)
+                nv = int(np.clip(nv, 1, 127))
+                rescaled.append((t, dur, midi, nv))
+            new_parts[name] = rescaled
+        return new_parts
+
     def _production_humanize(self, parts, drum_events, tempo, beats, seed=42):
         """生産品質のヒューマナイズ:
         - ±5 ランダムベロシティ揺らぎ (seed=曲ハッシュで再現可能)
@@ -2770,7 +2806,7 @@ class EarCopyEngine:
                 new_parts[name] = []
                 continue
             vels = [v for _, _, _, v in notes]
-            if name != 'pad' and len(vels) > 1 and float(np.std(vels)) < 10:
+            if name not in ('pad', 'chord') and len(vels) > 1 and float(np.std(vels)) < 10:
                 new_parts[name] = []
                 continue
             jitter_s = self._TIMING_JITTER.get(name, 0.010)
