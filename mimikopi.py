@@ -3667,9 +3667,31 @@ class EarCopyEngine:
             audio = _apply(audio)
         return audio
 
+    def _harmonic_exciter(self, audio, drive=0.3, mix=0.15):
+        """倍音生成エキサイター: 高域成分をソフトクリップし偶数倍音を生成。"""
+        nyq = SR / 2
+
+        def _process_1d(sig):
+            # 4kHz HPF で高域を抽出
+            b_hp, a_hp = butter(3, min(4000 / nyq, 0.99), btype='high')
+            hi = filtfilt(b_hp, a_hp, sig).astype(np.float32)
+            # ソフトクリップで倍音生成
+            driven = np.tanh(hi * (1.0 + drive * 4.0)).astype(np.float32)
+            # 5kHz HPF で生成した倍音のみ取り出す
+            b_hp2, a_hp2 = butter(3, min(5000 / nyq, 0.99), btype='high')
+            harmonics = filtfilt(b_hp2, a_hp2, driven).astype(np.float32)
+            return (sig + harmonics * mix).astype(np.float32)
+
+        if audio.ndim == 2:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _process_1d(audio[:, ch])
+        else:
+            audio = _process_1d(audio)
+        return audio
+
     def _master(self, audio):
         """プロダクション品質マスタリングチェーン:
-        DC除去 → HP/LP → 6段マスターEQ → ゲイン調整 → コンプ → リミット → LUFS → True Peak。
+        DC除去 → HP/LP → 6段マスターEQ → エキサイター → ゲイン調整 → コンプ → リミット → LUFS → True Peak。
         """
         if len(audio) == 0:
             return audio.astype(np.float32)
@@ -3696,6 +3718,9 @@ class EarCopyEngine:
 
         # 6段マスターEQ
         audio = self._master_eq(audio)
+
+        # ハーモニック・エキサイター (EQ後、コンプ前)
+        audio = self._harmonic_exciter(audio, drive=0.3, mix=0.15)
 
         # ゲイン調整: ピーク < 0.8
         peak = np.max(np.abs(audio))
