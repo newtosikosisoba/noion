@@ -3603,10 +3603,73 @@ class EarCopyEngine:
         audio = np.clip(audio, -0.999, 0.999).astype(np.float32)
         return audio
 
+    def _master_eq(self, audio):
+        """6 段マスター EQ チェーン。
+
+        1. ローシェルフ  -1dB @ 80Hz    (Sub軽減)
+        2. ベルカット    -4dB @ 350Hz   Q=1.0 (こもり除去)
+        3. ベルカット    -2dB @ 600Hz   Q=1.5 (LMid整理)
+        4. ベルブースト  +2dB @ 2.5kHz  Q=1.0 (抜け復活)
+        5. ベルブースト  +3dB @ 6kHz    Q=0.8 (HMid強化)
+        6. ハイシェルフ  +5dB @ 10kHz   (Air復活)
+        """
+        from scipy.signal import iirpeak
+        nyq = SR / 2
+        is_stereo = audio.ndim == 2
+
+        def _apply(sig):
+            # 1. Low shelf -1dB @ 80Hz (2nd order Butterworth LPF for shelf)
+            b_ls, a_ls = butter(2, min(80 / nyq, 0.99), btype='low')
+            low_part = filtfilt(b_ls, a_ls, sig).astype(np.float32)
+            gain_ls = 10 ** (-1.0 / 20.0)
+            sig = sig + (low_part * gain_ls - low_part)
+            sig = sig.astype(np.float32)
+
+            # 2. Bell cut -4dB @ 350Hz Q=1.0
+            w0 = min(350 / nyq, 0.99)
+            b2, a2 = iirpeak(w0, Q=1.0)
+            gain2 = 10 ** (-4.0 / 20.0)
+            filt2 = filtfilt(b2, a2, sig).astype(np.float32)
+            sig = (sig + (filt2 - sig) * (gain2 - 1.0)).astype(np.float32)
+
+            # 3. Bell cut -2dB @ 600Hz Q=1.5
+            w0 = min(600 / nyq, 0.99)
+            b3, a3 = iirpeak(w0, Q=1.5)
+            gain3 = 10 ** (-2.0 / 20.0)
+            filt3 = filtfilt(b3, a3, sig).astype(np.float32)
+            sig = (sig + (filt3 - sig) * (gain3 - 1.0)).astype(np.float32)
+
+            # 4. Bell boost +2dB @ 2.5kHz Q=1.0
+            w0 = min(2500 / nyq, 0.99)
+            b4, a4 = iirpeak(w0, Q=1.0)
+            gain4 = 10 ** (2.0 / 20.0)
+            filt4 = filtfilt(b4, a4, sig).astype(np.float32)
+            sig = (sig + (filt4 - sig) * (gain4 - 1.0)).astype(np.float32)
+
+            # 5. Bell boost +3dB @ 6kHz Q=0.8
+            w0 = min(6000 / nyq, 0.99)
+            b5, a5 = iirpeak(w0, Q=0.8)
+            gain5 = 10 ** (3.0 / 20.0)
+            filt5 = filtfilt(b5, a5, sig).astype(np.float32)
+            sig = (sig + (filt5 - sig) * (gain5 - 1.0)).astype(np.float32)
+
+            # 6. High shelf +5dB @ 10kHz
+            b_hs, a_hs = butter(2, min(10000 / nyq, 0.99), btype='high')
+            hi_part = filtfilt(b_hs, a_hs, sig).astype(np.float32)
+            gain_hs = 10 ** (5.0 / 20.0)
+            sig = sig + hi_part * (gain_hs - 1.0)
+            return sig.astype(np.float32)
+
+        if is_stereo:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _apply(audio[:, ch])
+        else:
+            audio = _apply(audio)
+        return audio
+
     def _master(self, audio):
         """プロダクション品質マスタリングチェーン:
-        DC除去 → HP/LP → コンプ (-18dB, 3:1) → ソフトリミット → -14 LUFS 正規化。
-        モノ (N,) とステレオ (N,2) の両方に対応。
+        DC除去 → HP/LP → 6段マスターEQ → ゲイン調整 → コンプ → リミット → LUFS → True Peak。
         """
         if len(audio) == 0:
             return audio.astype(np.float32)
@@ -3631,38 +3694,10 @@ class EarCopyEngine:
         else:
             audio = filtfilt(b, a, audio).astype(np.float32)
 
-        # マスター低域ブースト: +1.5dB @ 100Hz (ベース帯不足解消)
-        try:
-            from scipy.signal import iirpeak
-            w0_lo = min(100 / nyq, 0.99)
-            b_lo, a_lo = iirpeak(w0_lo, Q=0.7)
-            gain_lo = 10 ** (1.5 / 20.0)
-            if is_stereo:
-                for ch in range(audio.shape[1]):
-                    filt = filtfilt(b_lo, a_lo, audio[:, ch]).astype(np.float32)
-                    audio[:, ch] = (audio[:, ch] + (filt - audio[:, ch]) * (gain_lo - 1.0)).astype(np.float32)
-            else:
-                filt = filtfilt(b_lo, a_lo, audio).astype(np.float32)
-                audio = (audio + (filt - audio) * (gain_lo - 1.0)).astype(np.float32)
-        except Exception:
-            pass
+        # 6段マスターEQ
+        audio = self._master_eq(audio)
 
-        # マスターエア感: +1dB @ 12kHz
-        try:
-            w0_air = min(12000 / nyq, 0.99)
-            b_air, a_air = iirpeak(w0_air, Q=0.7)
-            gain_air = 10 ** (1.0 / 20.0)
-            if is_stereo:
-                for ch in range(audio.shape[1]):
-                    filt = filtfilt(b_air, a_air, audio[:, ch]).astype(np.float32)
-                    audio[:, ch] = (audio[:, ch] + (filt - audio[:, ch]) * (gain_air - 1.0)).astype(np.float32)
-            else:
-                filt = filtfilt(b_air, a_air, audio).astype(np.float32)
-                audio = (audio + (filt - audio) * (gain_air - 1.0)).astype(np.float32)
-        except Exception:
-            pass
-
-        # パートごとゲイン: 合計時にピーク<1.0 を目標
+        # ゲイン調整: ピーク < 0.8
         peak = np.max(np.abs(audio))
         if peak > 0.8:
             audio = (audio * (0.8 / peak)).astype(np.float32)
