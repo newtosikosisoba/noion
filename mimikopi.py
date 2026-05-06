@@ -2959,12 +2959,8 @@ class EarCopyEngine:
             # IRの準備
             hall_ir, room_ir = self._ensure_ir_files()
 
-            # 各グループにパートEQ + 空間処理を適用してミックス
             target_len = max(len(a) for a, _ in rendered_groups.values())
-            if rendered_groups and next(iter(rendered_groups.values()))[0].ndim == 2:
-                mix = np.zeros((target_len, 2), dtype=np.float32)
-            else:
-                mix = np.zeros(target_len, dtype=np.float32)
+            mix = np.zeros((target_len, 2), dtype=np.float32)
 
             for gname, (audio, gcfg) in rendered_groups.items():
                 # ドラムのトランジェント強調
@@ -2984,19 +2980,40 @@ class EarCopyEngine:
                     ir = room_ir if gname in ("drums", "bass") else hall_ir
                     if ir is not None:
                         audio = self._convolution_reverb(audio, ir, reverb_send)
+                # パート別ステレオ配置 (パン + Haas + 必要に応じてピンポン)
+                if gname == "drums":
+                    audio = self._spectral_drum_pan(audio)
+                else:
+                    pan, haas_ms, preserve, ping_pong = self.PART_STEREO.get(
+                        gname, (64, 0.0, False, 0.0))
+                    audio = self._apply_stereo_position(
+                        audio, pan=pan, haas_ms=haas_ms,
+                        preserve_stereo=preserve)
+                    if ping_pong > 0:
+                        audio = self._ping_pong_delay(
+                            audio, delay_ms=ping_pong, feedback=0.30, mix=0.18)
                 # 長さ合わせてミックス
                 n = min(len(audio), target_len)
-                if audio.ndim == mix.ndim:
+                if audio.ndim == 2:
                     mix[:n] += audio[:n]
-                elif audio.ndim == 1 and mix.ndim == 2:
+                else:
                     mix[:n, 0] += audio[:n]
                     mix[:n, 1] += audio[:n]
-                elif audio.ndim == 2 and mix.ndim == 1:
-                    mix[:n] += audio[:n].mean(axis=1)
 
             return mix.astype(np.float32)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    # パート別ステレオ配置: (pan, haas_ms, preserve_stereo, ping_pong_ms)
+    # 注: chord/pad は preserve_stereo=True で stereo_widen の効果を保つ
+    PART_STEREO = {
+        'melody':     ( 62,  0.0, False,  0.0),
+        'chord':      ( 75,  0.0, True,   0.0),
+        'bass':       ( 64,  0.0, False,  0.0),
+        'pad':        ( 64,  0.0, True,   0.0),
+        'decoration': ( 90,  0.0, False,  0.0),
+        'sub_melody': ( 50,  0.0, False,  0.0),
+    }
 
     def _pad_post_process(self, audio):
         """パッド専用後処理: コーラス + ステレオ展開 + パートEQ。"""
@@ -3230,6 +3247,104 @@ class EarCopyEngine:
         side *= width
         audio = np.column_stack([mid + side, mid - side]).astype(np.float32)
         return audio
+
+    # ---- パート別ステレオ配置 (パン + Haas) ------------------
+
+    def _apply_stereo_position(self, audio, pan=64, haas_ms=0.0,
+                                preserve_stereo=False):
+        """パートのステレオ位置を設定する。
+
+        pan: 0=L, 64=C, 127=R (constant-power)
+        haas_ms: R ch 遅延 (>0で擬似ステレオ広がり)
+        preserve_stereo: Trueなら既存L/R差を保持してパンを掛けない (Haasのみ)
+        """
+        if audio.ndim == 1:
+            audio = np.column_stack([audio, audio]).astype(np.float32)
+
+        if preserve_stereo:
+            L = audio[:, 0].copy()
+            R = audio[:, 1].copy()
+        else:
+            mono = (audio[:, 0] + audio[:, 1]) * 0.5
+            pan_norm = (pan - 64) / 63.0
+            angle = (pan_norm + 1.0) * np.pi / 4.0
+            L = mono * np.cos(angle) * np.sqrt(2.0)
+            R = mono * np.sin(angle) * np.sqrt(2.0)
+
+        if haas_ms > 0:
+            haas_samples = int(haas_ms * SR / 1000)
+            if 0 < haas_samples < len(R):
+                R_delayed = np.zeros_like(R)
+                R_delayed[haas_samples:] = R[:-haas_samples]
+                R = R_delayed
+
+        return np.column_stack([L, R]).astype(np.float32)
+
+    def _ping_pong_delay(self, audio, delay_ms=80.0,
+                          feedback=0.35, mix=0.20, taps=4):
+        """ピンポンディレイ: L→R→L→R と交互に減衰してリピート。"""
+        if audio.ndim == 1:
+            audio = np.column_stack([audio, audio]).astype(np.float32)
+        delay_samples = int(delay_ms * SR / 1000)
+        if delay_samples <= 0:
+            return audio
+        n = len(audio)
+        out_L = audio[:, 0].astype(np.float32).copy()
+        out_R = audio[:, 1].astype(np.float32).copy()
+        src = ((audio[:, 0] + audio[:, 1]) * 0.5).astype(np.float32)
+        for k in range(taps):
+            d = delay_samples * (k + 1)
+            if d >= n:
+                break
+            gain = mix * (feedback ** k)
+            delayed = np.zeros(n, dtype=np.float32)
+            delayed[d:] = src[:n - d] * gain
+            if k % 2 == 0:
+                out_R += delayed
+            else:
+                out_L += delayed
+        return np.column_stack([out_L, out_R]).astype(np.float32)
+
+    # ---- ドラム要素別 MIDI 分割 -----------------------------
+
+    # ドラムの周波数帯別パン (kick=低域=center, snare=中域=やや左, hihat=高域=右)
+    def _spectral_drum_pan(self, audio):
+        """ドラムを周波数帯ごとに分けてパンする (kick/snare/hihat 風配置)。
+
+        - <250Hz   (kick):   pan=64 (center)
+        - 250-2000Hz (snare): pan=60 (slight left)
+        - 2000-6000Hz (hihat): pan=85 (right)
+        - >6000Hz   (cymbal): pan=90 (further right)
+        """
+        if audio.ndim == 1:
+            audio = np.column_stack([audio, audio]).astype(np.float32)
+        nyq = SR / 2
+        mono = (audio[:, 0] + audio[:, 1]) * 0.5
+
+        def _bandpass(sig, lo, hi):
+            if lo <= 0:
+                b, a = butter(3, min(hi / nyq, 0.99), btype='low')
+            elif hi >= nyq * 0.99:
+                b, a = butter(3, lo / nyq, btype='high')
+            else:
+                b, a = butter(3, [lo / nyq, hi / nyq], btype='band')
+            return filtfilt(b, a, sig).astype(np.float32)
+
+        bands = [
+            (0, 250, 64),       # kick: center
+            (250, 2000, 60),    # snare: slight left
+            (2000, 6000, 85),   # hihat: right
+            (6000, nyq, 90),    # cymbal: further right
+        ]
+        L = np.zeros_like(mono)
+        R = np.zeros_like(mono)
+        for lo, hi, pan in bands:
+            band = _bandpass(mono, lo, hi)
+            pan_norm = (pan - 64) / 63.0
+            angle = (pan_norm + 1.0) * np.pi / 4.0
+            L += band * np.cos(angle) * np.sqrt(2.0)
+            R += band * np.sin(angle) * np.sqrt(2.0)
+        return np.column_stack([L, R]).astype(np.float32)
 
     # ---- コンボリューション・リバーブ (FFT) -----------------
 
@@ -3717,8 +3832,10 @@ class EarCopyEngine:
             return sig.astype(np.float32)
 
         if is_stereo:
-            for ch in range(audio.shape[1]):
-                audio[:, ch] = _apply(audio[:, ch])
+            mid = (audio[:, 0] + audio[:, 1]) * 0.5
+            side = (audio[:, 0] - audio[:, 1]) * 0.5
+            mid = _apply(mid)
+            audio = np.column_stack([mid + side, mid - side]).astype(np.float32)
         else:
             audio = _apply(audio)
         return audio
@@ -3747,7 +3864,7 @@ class EarCopyEngine:
 
     def _master(self, audio):
         """プロダクション品質マスタリングチェーン:
-        DC除去 → HP/LP → 6段マスターEQ → エキサイター → ゲイン調整 → コンプ → リミット → LUFS → True Peak。
+        DC除去 → HP/LP → 6段マスターEQ(Mid/Side) → エキサイター → ゲイン調整 → コンプ → リミット → LUFS(-16) → True Peak(-1.5dBTP)。
         """
         if len(audio) == 0:
             return audio.astype(np.float32)
@@ -3775,6 +3892,16 @@ class EarCopyEngine:
         # 6段マスターEQ
         audio = self._master_eq(audio)
 
+        # LRバランス補正 (パンニングによるエネルギー偏りを是正)
+        if is_stereo:
+            e_l = float(np.mean(audio[:, 0] ** 2) + 1e-12)
+            e_r = float(np.mean(audio[:, 1] ** 2) + 1e-12)
+            ratio_lr = e_l / e_r
+            if ratio_lr < 0.85 or ratio_lr > 1.15:
+                correction = np.sqrt(e_r / e_l)
+                correction = max(0.9, min(1.1, correction))
+                audio[:, 0] = (audio[:, 0] * correction).astype(np.float32)
+
         # ハーモニック・エキサイター (EQ後、コンプ前)
         audio = self._harmonic_exciter(audio, drive=0.3, mix=0.15)
 
@@ -3789,14 +3916,14 @@ class EarCopyEngine:
         # ソフトリミッター (-1dB threshold, lookahead 5ms)
         audio = self._soft_limit(audio, threshold_db=-1.0, lookahead_ms=5.0)
 
-        # -14 LUFS ラウドネス正規化 (YouTube 基準)
-        audio = self._lufs_normalize(audio, target_lufs=-14.0)
+        # -16 LUFS ラウドネス正規化 (歌ってみたボーカル合成用ヘッドルーム確保)
+        audio = self._lufs_normalize(audio, target_lufs=-16.0)
 
-        # True Peak リミッター (-1 dBTP、MP3エンコード後のISP防止)
-        audio = self._true_peak_limit(audio, ceiling_dbtp=-1.0)
+        # True Peak リミッター (-1.5 dBTP、ボーカル重ね時のISP防止)
+        audio = self._true_peak_limit(audio, ceiling_dbtp=-1.5)
 
-        # 安全網: ハードクリップ
-        audio = np.clip(audio, -0.891, 0.891).astype(np.float32)
+        # 安全網: ハードクリップ (-1.5 dBTP = 0.841)
+        audio = np.clip(audio, -0.841, 0.841).astype(np.float32)
 
         return audio
 

@@ -15,7 +15,8 @@ T6.  周波数バランス比 (出力/原曲) — 6帯域
 T7.  オンセット強度:  原曲の 0.85 倍以上
 T8.  BPM検出:        原曲 ±8 BPM 以内
 T9.  パート別ベロシティ (melody≥70, chord≥65, bass≥85, pad≥55+std≥5)
-T10. ステレオ相関係数: < 0.95
+T10. ステレオ相関係数: < 0.85
+T11. LRエネルギー比:    0.85〜1.15
 """
 
 import sys
@@ -399,7 +400,23 @@ class TestT10Stereo:
         if audio.ndim != 2 or audio.shape[1] != 2:
             pytest.fail("Output is not stereo")
         corr = float(np.corrcoef(audio[:, 0], audio[:, 1])[0, 1])
-        assert corr < 0.95, _fmt("T10 Stereo corr", corr, 0, 0.95)
+        assert corr < 0.85, _fmt("T10 Stereo corr", corr, 0, 0.85)
+
+
+# ===========================================================================
+# T11: LR energy ratio
+# ===========================================================================
+
+@pytest.mark.skipif(not shutil.which("fluidsynth"), reason="FluidSynth not installed")
+class TestT11LRBalance:
+    def test_lr_energy_ratio(self, pipeline):
+        audio = pipeline["audio"]
+        if audio.ndim != 2 or audio.shape[1] != 2:
+            pytest.fail("Output is not stereo")
+        energy_l = float(np.mean(audio[:, 0] ** 2))
+        energy_r = float(np.mean(audio[:, 1] ** 2))
+        ratio = energy_l / max(energy_r, 1e-12)
+        assert 0.85 <= ratio <= 1.15, _fmt("T11 LR energy ratio", ratio, 0.85, 1.15)
 
 
 # ===========================================================================
@@ -485,10 +502,14 @@ class TestSummary:
         results.append(("T9d pad vel mean", pad_avg, 55, 127))
         results.append(("T9e pad vel std", pad_std, 5.0, 999))
 
-        # T10
+        # T10 + T11
         if audio.ndim == 2 and audio.shape[1] == 2:
             corr = float(np.corrcoef(audio[:, 0], audio[:, 1])[0, 1])
-            results.append(("T10 Stereo corr", corr, -1.0, 0.95))
+            results.append(("T10 Stereo corr", corr, -1.0, 0.85))
+            energy_l = float(np.mean(audio[:, 0] ** 2))
+            energy_r = float(np.mean(audio[:, 1] ** 2))
+            lr_ratio = energy_l / max(energy_r, 1e-12)
+            results.append(("T11 LR energy ratio", lr_ratio, 0.85, 1.15))
 
         # ── 表出力 ──
         failures = []
