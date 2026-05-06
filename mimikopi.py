@@ -2970,6 +2970,9 @@ class EarCopyEngine:
                 # ドラムのトランジェント強調
                 if gname == "drums":
                     audio = self._transient_shape(audio)
+                # パッド後処理 (フェードイン/アウト + コーラス + ステレオ展開)
+                if gname == "pad":
+                    audio = self._pad_post_process(audio)
                 # パートEQ
                 audio = self._apply_part_eq(audio, gcfg.get("eq", {}), role=gname)
                 # ステレオワイドニング
@@ -2994,6 +2997,62 @@ class EarCopyEngine:
             return mix.astype(np.float32)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    def _pad_post_process(self, audio):
+        """パッド専用後処理: コーラス + ステレオ展開 + パートEQ。"""
+        fade_in = int(0.100 * SR)   # 100ms
+        fade_out = int(0.300 * SR)  # 300ms
+        nyq = SR / 2
+
+        def _process_1d(sig):
+            # フェードイン / フェードアウト
+            if len(sig) > fade_in:
+                sig[:fade_in] *= np.linspace(0, 1, fade_in, dtype=np.float32)
+            if len(sig) > fade_out:
+                sig[-fade_out:] *= np.linspace(1, 0, fade_out, dtype=np.float32)
+            return sig
+
+        if audio.ndim == 2:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _process_1d(audio[:, ch])
+        else:
+            audio = _process_1d(audio)
+
+        # コーラスエフェクト: LFO変調ディレイ (0.5Hz, depth 5ms, delay 15ms)
+        delay_samples = int(0.015 * SR)  # 15ms
+        depth_samples = int(0.005 * SR)  # 5ms
+        n = len(audio) if audio.ndim == 1 else audio.shape[0]
+        lfo = np.sin(2 * np.pi * 0.5 * np.arange(n) / SR).astype(np.float32)
+        mod_delay = delay_samples + (lfo * depth_samples).astype(int)
+        mod_delay = np.clip(mod_delay, 1, n - 1)
+
+        def _chorus_1d(sig):
+            delayed = np.zeros_like(sig)
+            for i in range(len(sig)):
+                idx = i - mod_delay[i]
+                if 0 <= idx < len(sig):
+                    delayed[i] = sig[idx]
+            return (sig * 0.7 + delayed * 0.3).astype(np.float32)
+
+        if audio.ndim == 2:
+            for ch in range(audio.shape[1]):
+                audio[:, ch] = _chorus_1d(audio[:, ch])
+        else:
+            audio = _chorus_1d(audio)
+
+        # ステレオ展開: ハース効果 (R を 10ms 遅延)
+        if audio.ndim == 1:
+            haas_delay = int(0.010 * SR)
+            right = np.zeros(len(audio), dtype=np.float32)
+            right[haas_delay:] = audio[:-haas_delay]
+            audio = np.column_stack([audio, right])
+        elif audio.ndim == 2 and audio.shape[1] == 2:
+            haas_delay = int(0.010 * SR)
+            right_delayed = np.zeros(audio.shape[0], dtype=np.float32)
+            right_delayed[haas_delay:] = audio[:-haas_delay, 1]
+            audio[:, 1] = right_delayed
+
+        return audio.astype(np.float32)
 
     def _transient_shape(self, audio, attack_gain_db=6.0, attack_ms=15.0, release_ms=30.0):
         """ドラムのアタックを強調するトランジェントシェイパー。"""
@@ -3072,13 +3131,13 @@ class EarCopyEngine:
     # ---- パートEQ ------------------------------------------
 
     ROLE_EQ = {
-        'bass': {'hpf': 35, 'lpf': 200, 'boost_hz': 80, 'boost_db': 4},
+        'bass': {'hpf': 35, 'lpf': 250, 'boost_hz': 80, 'boost_db': 5},
         'drums': {'hpf': 50, 'boost_hz': 60, 'boost_db': 4, 'lpf': 8000},
-        'melody': {'hpf': 250, 'boost_hz': 3000, 'boost_db': 2, 'boost2_hz': 8000, 'boost2_db': 1},
-        'chord': {'hpf': 180, 'cut_hz': 400, 'cut_db': -3, 'boost_hz': 5000, 'boost_db': 1},
-        'pad': {'hpf': 200, 'cut_hz': 1000, 'cut_db': -6, 'boost_hz': 12000, 'boost_db': 2},
-        'decoration': {'hpf': 300, 'boost_hz': 5000, 'boost_db': 1.5},
-        'sub_melody': {'hpf': 120, 'boost_hz': 2000, 'boost_db': 1},
+        'melody': {'hpf': 250, 'cut_hz': 500, 'cut_db': -4, 'boost_hz': 3000, 'boost_db': 3, 'boost2_hz': 8000, 'boost2_db': 2},
+        'chord': {'hpf': 200, 'cut_hz': 450, 'cut_db': -5, 'boost_hz': 5000, 'boost_db': 2},
+        'pad': {'hpf': 300, 'cut_hz': 500, 'cut_db': -6, 'boost_hz': 8000, 'boost_db': 3},
+        'decoration': {'hpf': 300, 'cut_hz': 500, 'cut_db': -3, 'boost_hz': 5000, 'boost_db': 2},
+        'sub_melody': {'hpf': 200, 'cut_hz': 500, 'cut_db': -4, 'boost_hz': 3000, 'boost_db': 1},
     }
 
     def _apply_part_eq(self, audio, eq_cfg, role=None):
@@ -3606,58 +3665,55 @@ class EarCopyEngine:
     def _master_eq(self, audio):
         """6 段マスター EQ チェーン。
 
-        1. ローシェルフ  -1dB @ 80Hz    (Sub軽減)
-        2. ベルカット    -4dB @ 350Hz   Q=1.0 (こもり除去)
-        3. ベルカット    -2dB @ 600Hz   Q=1.5 (LMid整理)
-        4. ベルブースト  +2dB @ 2.5kHz  Q=1.0 (抜け復活)
-        5. ベルブースト  +3dB @ 6kHz    Q=0.8 (HMid強化)
-        6. ハイシェルフ  +5dB @ 10kHz   (Air復活)
+        1. ローシェルフ  -1.5dB @ 80Hz      (Sub軽減)
+        2. ベルカット    -8dB @ 400Hz Q=0.5 (LMidこもり除去)
+           ベルカット    -4dB @ 650Hz Q=1.0 (上部LMid補正)
+        3. LMidバンドリダクション 250-800Hz -35%  (直接帯域カット)
+        4. ベルブースト  +2dB @ 2.5kHz Q=1.0 (抜け復活)
+        5. ベルブースト  +3dB @ 6kHz   Q=0.8 (HMid強化)
+        6. ハイシェルフ  +4dB @ 10kHz       (Air復活)
         """
         from scipy.signal import iirpeak
         nyq = SR / 2
         is_stereo = audio.ndim == 2
 
+        def _bell(sig, freq, gain_db, Q=1.0):
+            w0 = min(freq / nyq, 0.99)
+            b, a = iirpeak(w0, Q=Q)
+            gain = 10 ** (gain_db / 20.0)
+            filt = filtfilt(b, a, sig).astype(np.float64)
+            return (sig + (filt - sig) * (gain - 1.0)).astype(np.float32)
+
         def _apply(sig):
-            # 1. Low shelf -1dB @ 80Hz (2nd order Butterworth LPF for shelf)
+            sig = sig.astype(np.float64)
+
+            # 1. Low shelf -1.5dB @ 80Hz
             b_ls, a_ls = butter(2, min(80 / nyq, 0.99), btype='low')
-            low_part = filtfilt(b_ls, a_ls, sig).astype(np.float32)
-            gain_ls = 10 ** (-1.0 / 20.0)
+            low_part = filtfilt(b_ls, a_ls, sig)
+            gain_ls = 10 ** (-1.5 / 20.0)
             sig = sig + (low_part * gain_ls - low_part)
-            sig = sig.astype(np.float32)
 
-            # 2. Bell cut -4dB @ 350Hz Q=1.0
-            w0 = min(350 / nyq, 0.99)
-            b2, a2 = iirpeak(w0, Q=1.0)
-            gain2 = 10 ** (-4.0 / 20.0)
-            filt2 = filtfilt(b2, a2, sig).astype(np.float32)
-            sig = (sig + (filt2 - sig) * (gain2 - 1.0)).astype(np.float32)
+            # 2. Bell cuts for LMid taming
+            sig = _bell(sig, 400, -8.0, Q=0.5)
+            sig = _bell(sig, 650, -4.0, Q=1.0)
 
-            # 3. Bell cut -2dB @ 600Hz Q=1.5
-            w0 = min(600 / nyq, 0.99)
-            b3, a3 = iirpeak(w0, Q=1.5)
-            gain3 = 10 ** (-2.0 / 20.0)
-            filt3 = filtfilt(b3, a3, sig).astype(np.float32)
-            sig = (sig + (filt3 - sig) * (gain3 - 1.0)).astype(np.float32)
+            # 3. Direct LMid band reduction: extract 250-800Hz, subtract 35%
+            b_bp, a_bp = butter(3, [250 / nyq, 800 / nyq], btype='band')
+            lmid = filtfilt(b_bp, a_bp, sig)
+            sig = sig - lmid * 0.35
 
             # 4. Bell boost +2dB @ 2.5kHz Q=1.0
-            w0 = min(2500 / nyq, 0.99)
-            b4, a4 = iirpeak(w0, Q=1.0)
-            gain4 = 10 ** (2.0 / 20.0)
-            filt4 = filtfilt(b4, a4, sig).astype(np.float32)
-            sig = (sig + (filt4 - sig) * (gain4 - 1.0)).astype(np.float32)
+            sig = _bell(sig, 2500, +2.0, Q=1.0)
 
             # 5. Bell boost +3dB @ 6kHz Q=0.8
-            w0 = min(6000 / nyq, 0.99)
-            b5, a5 = iirpeak(w0, Q=0.8)
-            gain5 = 10 ** (3.0 / 20.0)
-            filt5 = filtfilt(b5, a5, sig).astype(np.float32)
-            sig = (sig + (filt5 - sig) * (gain5 - 1.0)).astype(np.float32)
+            sig = _bell(sig, 6000, +3.0, Q=0.8)
 
-            # 6. High shelf +5dB @ 10kHz
+            # 6. High shelf +4dB @ 10kHz
             b_hs, a_hs = butter(2, min(10000 / nyq, 0.99), btype='high')
-            hi_part = filtfilt(b_hs, a_hs, sig).astype(np.float32)
-            gain_hs = 10 ** (5.0 / 20.0)
+            hi_part = filtfilt(b_hs, a_hs, sig)
+            gain_hs = 10 ** (4.0 / 20.0)
             sig = sig + hi_part * (gain_hs - 1.0)
+
             return sig.astype(np.float32)
 
         if is_stereo:

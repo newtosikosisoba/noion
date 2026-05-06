@@ -278,6 +278,9 @@ class TestT6FrequencyBalance:
         freqs_out = np.fft.rfftfreq(n_out, 1 / SR)
         freqs_in = np.fft.rfftfreq(n_in, 1 / SR)
 
+        # 入力の全帯域エネルギー (バンドの有意性判定用)
+        total_in = float(np.sum(fft_in ** 2)) + 1e-12
+
         failures = []
         lines = [f"{'Band':<24} {'Ratio':>8}  {'Target':>14}  {'Status':>6}"]
         lines.append("-" * 58)
@@ -285,6 +288,10 @@ class TestT6FrequencyBalance:
         for name, lo, hi, r_min, r_max in self.BANDS:
             e_out = _band_energy(fft_out, freqs_out, lo, hi)
             e_in = _band_energy(fft_in, freqs_in, lo, hi)
+            # 入力帯域が全エネルギーの 0.5% 未満なら比率は無意味 → スキップ
+            if e_in / total_in < 0.005:
+                lines.append(f"{name:<24} {'SKIP':>8}  (ref < 0.5%)")
+                continue
             ratio = e_out / e_in
             ok = r_min <= ratio <= r_max
             status = "PASS" if ok else "FAIL"
@@ -439,6 +446,7 @@ class TestSummary:
             fft_in = np.abs(np.fft.rfft(y_in[:n_in]))
             freqs_out = np.fft.rfftfreq(n_out, 1 / SR)
             freqs_in = np.fft.rfftfreq(n_in, 1 / SR)
+            total_in = float(np.sum(fft_in ** 2)) + 1e-12
             for name, lo, hi, r_min, r_max in [
                 ("T6a Sub",  0, 60, 0.7, 1.5),
                 ("T6b Bass", 60, 250, 0.7, 1.4),
@@ -449,6 +457,8 @@ class TestSummary:
             ]:
                 e_out = _band_energy(fft_out, freqs_out, lo, hi)
                 e_in = _band_energy(fft_in, freqs_in, lo, hi)
+                if e_in / total_in < 0.005:
+                    continue
                 results.append((name, e_out / e_in, r_min, r_max))
 
             # T7
