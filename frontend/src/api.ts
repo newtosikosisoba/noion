@@ -14,6 +14,7 @@ export interface UserData {
 }
 
 export interface JobOutputs {
+  mp3: string | null;
   midi_full: string | null;
   midi_piano: string | null;
   midi_bass: string | null;

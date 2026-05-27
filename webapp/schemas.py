@@ -26,6 +26,7 @@ class JobCreateResponse(BaseModel):
 
 
 class JobOutputs(BaseModel):
+    mp3: Optional[str] = None
     midi_full: Optional[str] = None
     midi_piano: Optional[str] = None
     midi_bass: Optional[str] = None

@@ -28,3 +28,12 @@ Base = declarative_base()
 def init_db():
     from webapp import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+    _migrate(engine)
+
+
+def _migrate(eng):
+    with eng.connect() as conn:
+        cols = {row[1] for row in conn.execute(__import__("sqlalchemy").text("PRAGMA table_info(jobs)"))}
+        if "mp3_path" not in cols:
+            conn.execute(__import__("sqlalchemy").text("ALTER TABLE jobs ADD COLUMN mp3_path TEXT"))
+            conn.commit()

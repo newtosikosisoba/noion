@@ -47,6 +47,7 @@ class Job(Base):
     file_size = Column(Integer, nullable=False)
     duration_s = Column(Float)
     tier_at_creation = Column(Text, nullable=False)
+    mp3_path = Column(Text)
     midi_full_path = Column(Text)
     midi_piano_path = Column(Text)
     midi_bass_path = Column(Text)

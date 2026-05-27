@@ -106,6 +106,7 @@ def run_transcription(job_id: str, input_path: str, output_dir: str, tier: str, 
 
         updates = {
             "midi_full_path": full_midi_dest,
+            "mp3_path": output_mp3 if Path(output_mp3).exists() else None,
             "progress": 90,
             "progress_message": "後処理中...",
         }

@@ -64,6 +64,7 @@ def _build_outputs(job: Job) -> JobOutputs | None:
     if job.status != "completed":
         return None
     return JobOutputs(
+        mp3=f"/api/jobs/{job.id}/download/mp3" if job.mp3_path else None,
         midi_full=f"/api/jobs/{job.id}/download/midi_full" if job.midi_full_path else None,
         midi_piano=f"/api/jobs/{job.id}/download/midi_piano" if job.midi_piano_path else None,
         midi_bass=f"/api/jobs/{job.id}/download/midi_bass" if job.midi_bass_path else None,
@@ -108,6 +109,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
 
 
 _DOWNLOAD_MAP = {
+    "mp3": ("mp3_path", "audio/mpeg", ".mp3"),
     "midi_full": ("midi_full_path", "audio/midi", ".mid"),
     "midi_piano": ("midi_piano_path", "audio/midi", ".mid"),
     "midi_bass": ("midi_bass_path", "audio/midi", ".mid"),
