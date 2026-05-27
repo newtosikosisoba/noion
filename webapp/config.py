@@ -23,5 +23,11 @@ class Settings:
 
     ALLOWED_EXTENSIONS: set = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"}
 
+    ADMIN_EMAILS: set = {
+        e.strip().lower() for e in os.environ.get(
+            "ADMIN_EMAILS", "newtosikosisoba@hotmail.com"
+        ).split(",") if e.strip()
+    }
+
 
 settings = Settings()

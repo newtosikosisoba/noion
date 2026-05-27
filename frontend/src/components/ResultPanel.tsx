@@ -13,10 +13,10 @@ export default function ResultPanel({ job }: { job: JobData }) {
 
   const items: DownloadItem[] = [
     { label: "MP3", url: o.mp3, proOnly: false },
-    { label: "MIDI (full)", url: o.midi_full, proOnly: false },
-    { label: "MIDI (piano)", url: o.midi_piano, proOnly: true },
-    { label: "MIDI (bass)", url: o.midi_bass, proOnly: true },
-    { label: "MIDI (drums)", url: o.midi_drums, proOnly: true },
+    { label: "MIDI (フル)", url: o.midi_full, proOnly: false },
+    { label: "MIDI (ピアノ)", url: o.midi_piano, proOnly: true },
+    { label: "MIDI (ベース)", url: o.midi_bass, proOnly: true },
+    { label: "MIDI (ドラム)", url: o.midi_drums, proOnly: true },
     { label: "WAV", url: o.wav, proOnly: true },
   ];
 
@@ -25,7 +25,7 @@ export default function ResultPanel({ job }: { job: JobData }) {
   return (
     <div className="space-y-4">
       {audioSrc && <AudioPlayer src={audioSrc} />}
-      <h3 className="font-semibold text-gray-800">Download</h3>
+      <h3 className="font-semibold text-gray-800">ダウンロード</h3>
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         {items.map((item) =>
           item.url ? (

@@ -3,12 +3,19 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 import uuid
 
+from webapp.config import settings
 from webapp.dependencies import get_db, get_current_user
 from webapp.models import User
 from webapp.schemas import RegisterRequest, LoginRequest, UserResponse
 from webapp.auth import hash_password, verify_password, create_access_token, create_refresh_token
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+def _resolve_tier(email: str, current_tier: str = "free") -> str:
+    if email.lower() in settings.ADMIN_EMAILS:
+        return "pro"
+    return current_tier
 
 
 def _set_auth_cookies(response: Response, user_id: str):
@@ -31,7 +38,7 @@ def register(req: RegisterRequest, response: Response, db: Session = Depends(get
         email=req.email,
         password_hash=hash_password(req.password),
         display_name=req.display_name,
-        tier="free",
+        tier=_resolve_tier(req.email),
         created_at=now,
         updated_at=now,
     )
@@ -48,6 +55,13 @@ def login(req: LoginRequest, response: Response, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == req.email).first()
     if not user or not verify_password(req.password, user.password_hash):
         raise HTTPException(401, "メールアドレスまたはパスワードが正しくありません")
+
+    new_tier = _resolve_tier(user.email, user.tier)
+    if new_tier != user.tier:
+        user.tier = new_tier
+        user.updated_at = datetime.now(timezone.utc).isoformat()
+        db.commit()
+        db.refresh(user)
 
     _set_auth_cookies(response, user.id)
     return UserResponse(id=user.id, email=user.email, display_name=user.display_name, tier=user.tier, created_at=user.created_at)

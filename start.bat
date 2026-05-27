@@ -29,17 +29,13 @@ set HAS_NODE=0
 where node >nul 2>nul
 if not errorlevel 1 set HAS_NODE=1
 
-REM --- Frontend build ---
+REM --- Frontend build (always rebuild to pick up source changes) ---
 if "%HAS_NODE%"=="1" (
-    if not exist "frontend\dist\index.html" (
-        echo [2/4] Building frontend...
-        pushd frontend
-        if not exist "node_modules" call npm install
-        call npm run build
-        popd
-    ) else (
-        echo [2/4] Frontend already built - skip
-    )
+    echo [2/4] Building frontend...
+    pushd frontend
+    if not exist "node_modules" call npm install
+    call npm run build
+    popd
 ) else (
     echo [2/4] Node.js not found - skipping frontend build
     echo       API will be available at http://localhost:8000/docs

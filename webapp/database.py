@@ -29,11 +29,26 @@ def init_db():
     from webapp import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
     _migrate(engine)
+    _promote_admins(engine)
 
 
 def _migrate(eng):
+    from sqlalchemy import text
     with eng.connect() as conn:
-        cols = {row[1] for row in conn.execute(__import__("sqlalchemy").text("PRAGMA table_info(jobs)"))}
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(jobs)"))}
         if "mp3_path" not in cols:
-            conn.execute(__import__("sqlalchemy").text("ALTER TABLE jobs ADD COLUMN mp3_path TEXT"))
+            conn.execute(text("ALTER TABLE jobs ADD COLUMN mp3_path TEXT"))
             conn.commit()
+
+
+def _promote_admins(eng):
+    from sqlalchemy import text
+    if not settings.ADMIN_EMAILS:
+        return
+    with eng.connect() as conn:
+        for email in settings.ADMIN_EMAILS:
+            conn.execute(
+                text("UPDATE users SET tier='pro' WHERE LOWER(email)=:e AND tier != 'pro'"),
+                {"e": email},
+            )
+        conn.commit()
